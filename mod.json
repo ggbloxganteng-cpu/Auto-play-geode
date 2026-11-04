@@ -1,0 +1,75 @@
+{
+	"geode": "v5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "yourname.auto-trajectory",
+	"name": "Auto Trajectory",
+	"version": "v0.2.0",
+	"developer": "yourname",
+	"description": "Auto play bot with a live jump trajectory overlay.",
+	"links": {
+		"source": "https://github.com/yourname/auto-trajectory"
+	},
+	"settings": {
+		"gameplay-title": {
+			"type": "title",
+			"name": "Gameplay"
+		},
+		"auto-play": {
+			"type": "bool",
+			"name": "Auto Play",
+			"description": "Automatically jumps when releasing would crash the player within the preview window. Cube/ball modes only (no dual, platformer, or flying modes).",
+			"default": false
+		},
+		"show-trajectory": {
+			"type": "bool",
+			"name": "Show Trajectory",
+			"description": "Draws the predicted path for holding and releasing jump.",
+			"default": true
+		},
+		"trajectory-title": {
+			"type": "title",
+			"name": "Trajectory"
+		},
+		"trajectory-steps": {
+			"type": "int",
+			"name": "Trajectory Length",
+			"description": "How many physics substeps (240 per second) of the future to draw.",
+			"default": 132,
+			"min": 10,
+			"max": 400,
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"arrow-step": 12
+			}
+		},
+		"autoplay-lookahead": {
+			"type": "int",
+			"name": "Auto Play Lookahead",
+			"description": "How many physics substeps (240 per second) the bot looks ahead before deciding to jump.",
+			"default": 132,
+			"min": 24,
+			"max": 240,
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"arrow-step": 12
+			}
+		},
+		"ui-title": {
+			"type": "title",
+			"name": "Interface"
+		},
+		"show-ui": {
+			"type": "bool",
+			"name": "Show In-Game Buttons",
+			"description": "Shows the Auto Play / Trajectory toggle buttons while playing.",
+			"default": true
+		}
+	}
+}
