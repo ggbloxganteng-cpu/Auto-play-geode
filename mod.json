@@ -1,0 +1,75 @@
+{
+	"geode": "v5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "yourname.auto-trajectory",
+	"name": "Auto Trajectory",
+	"version": "v0.1.0",
+	"developer": "yourname",
+	"description": "Auto play bot with a live jump trajectory overlay.",
+	"links": {
+		"source": "https://github.com/yourname/auto-trajectory"
+	},
+	"settings": {
+		"gameplay-title": {
+			"type": "title",
+			"name": "Gameplay"
+		},
+		"auto-play": {
+			"type": "bool",
+			"name": "Auto Play",
+			"description": "Automatically jumps when the predicted path is about to hit a hazard.",
+			"default": false
+		},
+		"show-trajectory": {
+			"type": "bool",
+			"name": "Show Trajectory",
+			"description": "Draws the predicted path for holding and releasing jump.",
+			"default": true
+		},
+		"trajectory-title": {
+			"type": "title",
+			"name": "Trajectory"
+		},
+		"trajectory-steps": {
+			"type": "int",
+			"name": "Trajectory Length",
+			"description": "How many physics ticks of the future to draw.",
+			"default": 90,
+			"min": 10,
+			"max": 600,
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"arrow-step": 10
+			}
+		},
+		"autoplay-lookahead": {
+			"type": "int",
+			"name": "Auto Play Lookahead",
+			"description": "How many physics ticks the bot looks ahead before deciding to jump.",
+			"default": 24,
+			"min": 5,
+			"max": 120,
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"arrow-step": 1
+			}
+		},
+		"ui-title": {
+			"type": "title",
+			"name": "Interface"
+		},
+		"show-ui": {
+			"type": "bool",
+			"name": "Show In-Game Buttons",
+			"description": "Shows the Auto Play / Trajectory toggle buttons while playing.",
+			"default": true
+		}
+	}
+}
