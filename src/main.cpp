@@ -17,6 +17,20 @@ namespace {
     float g_stepDt = 0.25f;
     bool g_warnedStepZero = false;
 
+    // Player-1 physics substeps seen since the last postUpdate, and the
+    // substeps-per-frame value measured from it (used to time the jump).
+    int g_stepCounter = 0;
+    int g_frameSubsteps = 4;
+
+    // Simulation tuning, all in physics substeps (240 per second).
+    constexpr int kJumpAirborneSteps = 15; // consecutive airborne substeps that count as a real jump
+    constexpr int kLandSettleSteps = 16;   // consecutive grounded substeps after a jump = landed safely
+    constexpr int kWaitMarginSteps = 2;    // safety margin when deciding to wait for a later jump
+    constexpr int kDoomedMargin = 4;       // when nothing survives, press only if clearly better
+    constexpr int kImminentSteps = 16;     // hazard this close: stop waiting, jump now if it works
+
+    const cocos2d::ccColor4F kNoColor{0.f, 0.f, 0.f, 0.f};
+
     bool autoPlayEnabled() {
         return Mod::get()->getSettingValue<bool>("auto-play");
     }
@@ -72,14 +86,25 @@ namespace {
 struct SimResult {
     bool died = false;
     int survived = 0;
+    // Only meaningful when died: true if the death looks like a jump that
+    // started too late (hit something while still taking off, or never took
+    // off). false = too early (died after landing / late in the jump).
+    bool late = false;
     cocos2d::CCPoint deathPos = {0.f, 0.f};
+};
+
+enum class SimPlan {
+    Release, // never press
+    Hold,    // press after the delay and keep holding (cube keeps bunny hopping)
+    Tap      // press after the delay, let go as soon as the player has left the ground
 };
 
 SimResult runSimulation(
     PlayLayer* pl,
     PlayerObject* dummy,
     PlayerObject* source,
-    bool holdJump,
+    SimPlan plan,
+    int pressDelay,
     int maxSteps,
     int drawSteps,
     float dt,
@@ -98,27 +123,40 @@ SimResult runSimulation(
     syncDummy(dummy, source);
 
     resetCollisionLog(dummy);
-    if (holdJump) {
-        dummy->pushButton(PlayerButton::Jump);
-    } else {
-        dummy->releaseButton(PlayerButton::Jump);
-    }
+    dummy->releaseButton(PlayerButton::Jump);
 
     const bool flying = isFlyingMode(source);
+    bool pressed = false;
+    bool tapDone = false;
+    bool tapArmed = false;
+    bool jumped = false;
     int airborneStreak = 0;
     int landedStreak = 0;
 
     cocos2d::CCPoint previous = dummy->getPosition();
 
+    auto markDeath = [&](int step) {
+        result.died = true;
+        result.deathPos = dummy->getPosition();
+        result.late = !flying && !(
+            airborneStreak >= kJumpAirborneSteps || (jumped && dummy->m_isOnGround)
+        );
+        if (draw && step <= drawSteps) {
+            draw->drawDot(dummy->getPosition(), 4.f, color);
+        }
+    };
+
     for (int i = 0; i < maxSteps; ++i) {
+        if (plan != SimPlan::Release && !pressed && i >= pressDelay) {
+            dummy->pushButton(PlayerButton::Jump);
+            pressed = true;
+            tapArmed = dummy->m_isOnGround;
+        }
+
         dummy->update(dt);
 
         if (g_simDead || dummy->m_isDead) {
-            result.died = true;
-            result.deathPos = dummy->getPosition();
-            if (draw && i <= drawSteps) {
-                draw->drawDot(dummy->getPosition(), 4.f, color);
-            }
+            markDeath(i);
             break;
         }
 
@@ -126,11 +164,7 @@ SimResult runSimulation(
         pl->checkCollisions(dummy, dt, false);
 
         if (g_simDead || dummy->m_isDead) {
-            result.died = true;
-            result.deathPos = dummy->getPosition();
-            if (draw && i <= drawSteps) {
-                draw->drawDot(dummy->getPosition(), 4.f, color);
-            }
+            markDeath(i);
             break;
         }
 
@@ -142,18 +176,31 @@ SimResult runSimulation(
 
         ++result.survived;
 
-        if (!flying && dummy->m_isOnGround) {
-            if (airborneStreak >= 15) {
-                ++landedStreak;
-                if (landedStreak >= 8) {
+        // Tap: the jump has happened once the player left the ground, so let go.
+        if (plan == SimPlan::Tap && pressed && !tapDone) {
+            if (dummy->m_isOnGround) {
+                tapArmed = true;
+            } else if (tapArmed) {
+                dummy->releaseButton(PlayerButton::Jump);
+                tapDone = true;
+            }
+        }
+
+        // A real jump that landed and stayed on the ground for a moment counts
+        // as safe (the next obstacle is handled by the next decision).
+        if (!flying) {
+            if (dummy->m_isOnGround) {
+                airborneStreak = 0;
+                if (jumped && ++landedStreak >= kLandSettleSteps) {
                     result.survived = maxSteps;
                     break;
                 }
             } else {
-                airborneStreak = 0;
+                landedStreak = 0;
+                if (++airborneStreak >= kJumpAirborneSteps) {
+                    jumped = true;
+                }
             }
-        } else {
-            ++airborneStreak;
         }
     }
 
@@ -165,12 +212,89 @@ SimResult runSimulation(
     return result;
 }
 
+enum class JumpOutlook {
+    Survives, // a jump starting after the delay gets through
+    TooEarly, // it fails, but only because the jump would start too early
+    TooLate   // it fails because the jump window is already over
+};
+
+// How does a jump that starts after `delay` substeps fare? Tries a single jump
+// first, then holding (bunny hop). With earlyExit, a "too early" single jump
+// is returned right away (cheaper; enough when you only need to know whether
+// waiting is still fine).
+JumpOutlook jumpOutlook(
+    PlayLayer* pl, PlayerObject* dummy, PlayerObject* source,
+    int delay, int steps, float dt, bool earlyExit, int& bestSurvived
+) {
+    bool allLate = true;
+    for (SimPlan plan : {SimPlan::Tap, SimPlan::Hold}) {
+        SimResult r = runSimulation(
+            pl, dummy, source, plan, delay, steps, 0, dt, nullptr, kNoColor
+        );
+        bestSurvived = std::max(bestSurvived, r.survived);
+        if (!r.died) return JumpOutlook::Survives;
+        if (!r.late) {
+            allLate = false;
+            if (earlyExit) return JumpOutlook::TooEarly;
+        }
+    }
+    return allLate ? JumpOutlook::TooLate : JumpOutlook::TooEarly;
+}
+
+// Decides whether the bot should be holding the button this frame.
+// `idle` is the "release now" simulation (it may be longer than botSteps).
+bool decideAutoPress(
+    PlayLayer* pl, PlayerObject* dummy, PlayerObject* source,
+    SimResult const& idle, int botSteps, float dt
+) {
+    // Nothing dangerous inside the lookahead window: stay released.
+    if (!(idle.died && idle.survived < botSteps)) {
+        return false;
+    }
+
+    // Flying modes: keep the original hold-vs-release comparison.
+    if (isFlyingMode(source)) {
+        SimResult hold = runSimulation(
+            pl, dummy, source, SimPlan::Hold, 0, botSteps, 0, dt, nullptr, kNoColor
+        );
+        return !hold.died || hold.survived > idle.survived + 2;
+    }
+
+    // Cube / ball / etc: jump at the LAST safe moment instead of the moment the
+    // danger first shows up. Look at a jump that would start one frame from now:
+    //  - it works, or it only fails for being too early -> keep waiting
+    //  - it fails for being too late -> the window is closing, jump now
+    const int frameSteps = std::clamp(g_frameSubsteps, 1, 16);
+    const int waitDelay = frameSteps + kWaitMarginSteps;
+
+    int waitBest = 0;
+    JumpOutlook waitOutlook = jumpOutlook(
+        pl, dummy, source, waitDelay, botSteps, dt, true, waitBest
+    );
+    if (waitOutlook == JumpOutlook::Survives) return false;
+    if (waitOutlook == JumpOutlook::TooEarly &&
+        idle.survived > waitDelay + kImminentSteps) {
+        return false;
+    }
+
+    // Waiting is over: jump now if that gets through.
+    int pressBest = 0;
+    if (jumpOutlook(pl, dummy, source, 0, botSteps, dt, false, pressBest) ==
+        JumpOutlook::Survives) {
+        return true;
+    }
+
+    // Nothing survives: only press if it is clearly the longest-lasting option.
+    return pressBest > std::max(idle.survived, waitBest) + kDoomedMargin;
+}
+
 class $modify(AutoTrajPlayerObject, PlayerObject) {
     void update(float dt) {
         PlayerObject::update(dt);
         if (g_simulating) return;
 
         if (auto pl = PlayLayer::get(); pl && pl->m_player1 == this) {
+            ++g_stepCounter;
             if (dt > 0.001f && dt < 2.f) {
                 float warp = pl->m_gameState.m_timeWarp;
                 if (!(warp > 0.f)) warp = 1.f;
@@ -380,6 +504,11 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
     void postUpdate(float dt) override {
         PlayLayer::postUpdate(dt);
 
+        if (g_stepCounter > 0) {
+            g_frameSubsteps = std::clamp(g_stepCounter, 1, 16);
+        }
+        g_stepCounter = 0;
+
         const bool autoOn = autoPlayEnabled();
         const bool trajOn = trajectoryEnabled();
         const bool uiOn = uiEnabled();
@@ -436,6 +565,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             dtStep = 0.25f;
         }
 
+        // The overlay length is purely visual. The bot has its own lookahead,
+        // so changing one never changes how the other behaves.
         int drawSteps = trajOn ? std::clamp(trajectorySteps(), 10, 400) : 0;
         int botSteps = autoOn ? std::clamp(autoPlayLookahead(), 24, 240) : 0;
         int horizon = std::max(drawSteps, botSteps);
@@ -445,18 +576,21 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             return;
         }
 
-        SimResult holdResult{};
-        SimResult idleResult{};
+        auto* drawNode = drawSteps > 0 ? m_fields->drawNode : nullptr;
 
-        holdResult = runSimulation(
-            this, m_fields->dummy1, m_player1, true, horizon, drawSteps, dtStep,
-            drawSteps > 0 ? m_fields->drawNode : nullptr,
-            cocos2d::ccColor4F{0.15f, 1.f, 0.35f, 1.f}
-        );
-        idleResult = runSimulation(
-            this, m_fields->dummy1, m_player1, false, horizon, drawSteps, dtStep,
-            drawSteps > 0 ? m_fields->drawNode : nullptr,
-            cocos2d::ccColor4F{1.f, 0.3f, 0.3f, 1.f}
+        // Green: press & hold now (overlay only).
+        SimResult holdResult{};
+        if (drawSteps > 0) {
+            holdResult = runSimulation(
+                this, m_fields->dummy1, m_player1, SimPlan::Hold, 0, drawSteps, drawSteps, dtStep,
+                drawNode, cocos2d::ccColor4F{0.15f, 1.f, 0.35f, 1.f}
+            );
+        }
+
+        // Red: release now. Shared with the bot's "is it dangerous?" check.
+        SimResult idleResult = runSimulation(
+            this, m_fields->dummy1, m_player1, SimPlan::Release, 0, horizon, drawSteps, dtStep,
+            drawNode, cocos2d::ccColor4F{1.f, 0.3f, 0.3f, 1.f}
         );
 
         if (trajOn && holdResult.died && idleResult.died &&
@@ -468,20 +602,12 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             );
         }
 
-        bool keepHold = false;
-        if (autoOn) {
-            if (idleResult.died) {
-                keepHold = !holdResult.died ||
-                           holdResult.survived > idleResult.survived + 2;
-            }
-
-            if (keepHold) {
-                if (!m_fields->botHolding) {
-                    this->handleButton(true, 1, true);
-                    m_fields->botHolding = true;
-                }
-            } else {
-                this->releaseBot();
+        if (autoOn && decideAutoPress(
+            this, m_fields->dummy1, m_player1, idleResult, botSteps, dtStep
+        )) {
+            if (!m_fields->botHolding) {
+                this->handleButton(true, 1, true);
+                m_fields->botHolding = true;
             }
         } else {
             this->releaseBot();
@@ -502,5 +628,5 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 };
 
 $on_mod(Loaded) {
-    log::info("Auto Trajectory v0.2.0 loaded");
+    log::info("Auto Trajectory v0.2.1 loaded");
 }
