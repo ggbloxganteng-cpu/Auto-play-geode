@@ -29,7 +29,7 @@ namespace {
     constexpr int kDoomedMargin = 4;       // when nothing survives, press only if clearly better
     constexpr int kImminentSteps = 16;     // hazard this close: stop waiting, jump now if it works
     constexpr int kTapBudgetSteps = 180;   // max substeps an in-flight tap may wait for its landing
-    constexpr int kFlySwitchMargin = 2;    // ship: switch input only if clearly better (anti-flap)
+    constexpr int kFlySwitchMargin = 2;    // ship/wave: switch input only if clearly better (anti-flap)
 
     const cocos2d::ccColor4F kNoColor{0.f, 0.f, 0.f, 0.f};
 
@@ -259,7 +259,7 @@ JumpOutlook jumpOutlook(
 
 // Decides what the bot should do this frame.
 // `idle` is the "release now" simulation (it may be longer than botSteps).
-// `currentlyHolding` is the real current input, used for ship hysteresis.
+// `currentlyHolding` is the real current input, used for flying hysteresis.
 BotAction decideAutoPress(
     PlayLayer* pl, PlayerObject* dummy, PlayerObject* source,
     SimResult const& idle, int botSteps, float dt, bool currentlyHolding
@@ -419,6 +419,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
     struct Fields {
         cocos2d::CCDrawNode* drawNode = nullptr;
         PlayerObject* dummy1 = nullptr;
+        PlayerObject* dummy2 = nullptr;
         cocos2d::CCMenu* menu = nullptr;
         cocos2d::CCLabelBMFont* autoLabel = nullptr;
         cocos2d::CCLabelBMFont* trajLabel = nullptr;
@@ -426,6 +427,10 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         bool botTapActive = false;
         bool botTapGrounded = false;
         int botTapBudget = 0;
+        bool bot2Holding = false;
+        bool bot2TapActive = false;
+        bool bot2TapGrounded = false;
+        int bot2TapBudget = 0;
         bool loggedSetup = false;
         bool lastAuto = false;
         bool lastTraj = true;
@@ -454,11 +459,27 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             m_fields->dummy1 = nullptr;
         }
 
+        // Second dummy for dual mode (player 2). Only used when the level is
+        // actually dual; kept invisible otherwise.
+        m_fields->dummy2 = PlayerObject::create(1, 1, this, this, true);
+        if (m_fields->dummy2 && m_objectLayer) {
+            m_fields->dummy2->setVisible(false);
+            m_fields->dummy2->setID("autotraj-dummy-2"_spr);
+            m_fields->dummy2->retain();
+            m_objectLayer->addChild(m_fields->dummy2, 999);
+        } else {
+            m_fields->dummy2 = nullptr;
+        }
+
         this->setupMenu();
         m_fields->botHolding = false;
         m_fields->botTapActive = false;
         m_fields->botTapGrounded = false;
         m_fields->botTapBudget = 0;
+        m_fields->bot2Holding = false;
+        m_fields->bot2TapActive = false;
+        m_fields->bot2TapGrounded = false;
+        m_fields->bot2TapBudget = 0;
         m_fields->loggedSetup = false;
         g_warnedStepZero = false;
 
@@ -526,6 +547,26 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->botTapBudget = 0;
     }
 
+    void releaseBot2() {
+        if (m_fields->bot2Holding && m_player2) {
+            this->handleButton(false, 2, true);
+        }
+        m_fields->bot2Holding = false;
+    }
+
+    void pressBot2() {
+        if (!m_fields->bot2Holding && m_player2) {
+            this->handleButton(true, 2, true);
+            m_fields->bot2Holding = true;
+        }
+    }
+
+    void cancelTap2() {
+        m_fields->bot2TapActive = false;
+        m_fields->bot2TapGrounded = false;
+        m_fields->bot2TapBudget = 0;
+    }
+
     void destroyPlayer(PlayerObject* player, GameObject* object) override {
         if (g_simulating && g_simDummy && player == g_simDummy) {
             g_simDead = true;
@@ -537,12 +578,18 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             m_fields->botHolding = false;
             this->cancelTap();
         }
+        if (player == m_player2) {
+            m_fields->bot2Holding = false;
+            this->cancelTap2();
+        }
     }
 
     void resetLevel() override {
         PlayLayer::resetLevel();
         m_fields->botHolding = false;
         this->cancelTap();
+        m_fields->bot2Holding = false;
+        this->cancelTap2();
     }
 
     void playEndAnimationToPos(cocos2d::CCPoint pos) {
@@ -555,6 +602,73 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         PlayLayer::flipGravity(player, flip, noEffects);
     }
 
+    // Runs the per-player decision + input mirroring for one player/dummy pair.
+    // Returns the action chosen (for debugging / future use).
+    BotAction runBotForPlayer(
+        PlayerObject* player,
+        PlayerObject* dummy,
+        SimResult const& idleResult,
+        int botSteps,
+        float dtStep,
+        bool& holding,
+        bool& tapActive,
+        bool& tapGrounded,
+        int& tapBudget,
+        void (AutoTrajPlayLayer::*press)(),
+        void (AutoTrajPlayLayer::*release)(),
+        void (AutoTrajPlayLayer::*cancel)()
+    ) {
+        // Finish an in-flight tap before anything else: the simulation that
+        // validated it assumed the button stays down until the player has left
+        // the ground after touching it. Releasing earlier would desync the
+        // real input from the validated plan (this is what made the bot jump
+        // only once at multi-pillar hold sections).
+        //
+        // A tap only counts as launched once the player has been on the ground
+        // AFTER the press and then left the ground again. If the player was
+        // airborne at press time (e.g. late frame), we keep holding until the
+        // next real takeoff, exactly like the simulation does.
+        bool tapForcedHold = false;
+        if (tapActive) {
+            if (player->m_isOnGround) {
+                tapGrounded = true;
+            }
+            tapBudget -= std::max(1, g_frameSubsteps);
+            bool launched = tapGrounded && !player->m_isOnGround;
+            if (launched || tapBudget <= 0) {
+                (this->*cancel)();
+            } else {
+                tapForcedHold = true;
+            }
+        }
+
+        BotAction action = tapForcedHold
+            ? BotAction::Hold
+            : decideAutoPress(this, dummy, player, idleResult, botSteps, dtStep, holding);
+
+        switch (action) {
+            case BotAction::Hold:
+                (this->*cancel)();
+                (this->*press)();
+                break;
+            case BotAction::Tap:
+                // Mirrors SimPlan::Tap: press now, keep holding until the
+                // player has been grounded and left the ground again.
+                (this->*press)();
+                if (!tapActive) {
+                    tapActive = true;
+                    tapGrounded = false; // require a grounded phase after press
+                    tapBudget = kTapBudgetSteps;
+                }
+                break;
+            case BotAction::Release:
+            default:
+                (this->*cancel)();
+                (this->*release)();
+                break;
+        }
+        return action;
+    }
     void postUpdate(float dt) override {
         PlayLayer::postUpdate(dt);
 
@@ -607,12 +721,16 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         if (!m_player1 || m_player1->m_isDead || !m_fields->dummy1) {
             this->releaseBot();
             this->cancelTap();
+            this->releaseBot2();
+            this->cancelTap2();
             return;
         }
 
-        if (m_player1->m_isPlatformer || m_gameState.m_isDualMode) {
+        if (m_player1->m_isPlatformer) {
             this->releaseBot();
             this->cancelTap();
+            this->releaseBot2();
+            this->cancelTap2();
             return;
         }
 
@@ -630,6 +748,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         if (horizon <= 0) {
             this->releaseBot();
             this->cancelTap();
+            this->releaseBot2();
+            this->cancelTap2();
             return;
         }
 
@@ -659,66 +779,64 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             );
         }
 
-        // Finish an in-flight tap before anything else: the simulation that
-        // validated it assumed the button stays down until the player has left
-        // the ground after touching it. Releasing earlier would desync the
-        // real input from the validated plan (this is what made the bot jump
-        // only once at multi-pillar hold sections).
-        bool tapForcedHold = false;
-        if (m_fields->botTapActive) {
-            if (m_player1->m_isOnGround) {
-                m_fields->botTapGrounded = true;
-            }
-            m_fields->botTapBudget -= std::max(1, g_frameSubsteps);
-            bool launched = m_fields->botTapGrounded && !m_player1->m_isOnGround;
-            if (launched || m_fields->botTapBudget <= 0) {
-                this->cancelTap();
-            } else {
-                tapForcedHold = true;
-            }
-        }
-
+        // ---- Player 1 bot ----
         if (autoOn) {
-            BotAction action = tapForcedHold
-                ? BotAction::Hold
-                : decideAutoPress(
-                      this, m_fields->dummy1, m_player1, idleResult, botSteps, dtStep,
-                      m_fields->botHolding
-                  );
-
-            switch (action) {
-                case BotAction::Hold:
-                    this->cancelTap();
-                    this->pressBot();
-                    break;
-                case BotAction::Tap:
-                    // Mirrors SimPlan::Tap: press now, keep holding until the
-                    // player has been grounded and left the ground again.
-                    this->pressBot();
-                    if (!m_fields->botTapActive) {
-                        m_fields->botTapActive = true;
-                        m_fields->botTapGrounded = m_player1->m_isOnGround;
-                        m_fields->botTapBudget = kTapBudgetSteps;
-                    }
-                    break;
-                case BotAction::Release:
-                default:
-                    this->cancelTap();
-                    this->releaseBot();
-                    break;
-            }
+            this->runBotForPlayer(
+                m_player1, m_fields->dummy1, idleResult, botSteps, dtStep,
+                m_fields->botHolding, m_fields->botTapActive,
+                m_fields->botTapGrounded, m_fields->botTapBudget,
+                &AutoTrajPlayLayer::pressBot,
+                &AutoTrajPlayLayer::releaseBot,
+                &AutoTrajPlayLayer::cancelTap
+            );
         } else {
             this->releaseBot();
             this->cancelTap();
+        }
+
+        // ---- Player 2 bot (dual mode) ----
+        bool dualActive = m_gameState.m_isDualMode && m_player2 && !m_player2->m_isDead && m_fields->dummy2;
+        if (dualActive) {
+            // Blue: player 2 press & hold (overlay only).
+            if (drawSteps > 0) {
+                runSimulation(
+                    this, m_fields->dummy2, m_player2, SimPlan::Hold, 0, drawSteps, drawSteps, dtStep,
+                    drawNode, cocos2d::ccColor4F{0.3f, 0.6f, 1.f, 1.f}
+                );
+            }
+            // Yellow: player 2 release.
+            SimResult idle2 = runSimulation(
+                this, m_fields->dummy2, m_player2, SimPlan::Release, 0, horizon, drawSteps, dtStep,
+                drawNode, cocos2d::ccColor4F{1.f, 0.9f, 0.2f, 1.f}
+            );
+            if (autoOn) {
+                this->runBotForPlayer(
+                    m_player2, m_fields->dummy2, idle2, botSteps, dtStep,
+                    m_fields->bot2Holding, m_fields->bot2TapActive,
+                    m_fields->bot2TapGrounded, m_fields->bot2TapBudget,
+                    &AutoTrajPlayLayer::pressBot2,
+                    &AutoTrajPlayLayer::releaseBot2,
+                    &AutoTrajPlayLayer::cancelTap2
+                );
+            } else {
+                this->releaseBot2();
+                this->cancelTap2();
+            }
+        } else {
+            this->releaseBot2();
+            this->cancelTap2();
         }
     }
 
     void onQuit() {
         this->releaseBot();
         this->cancelTap();
+        this->releaseBot2();
+        this->cancelTap2();
 
         m_fields->drawNode = nullptr;
         m_fields->dummy1 = nullptr;
+        m_fields->dummy2 = nullptr;
         m_fields->menu = nullptr;
         m_fields->autoLabel = nullptr;
         m_fields->trajLabel = nullptr;
@@ -728,5 +846,5 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 };
 
 $on_mod(Loaded) {
-    log::info("Auto Trajectory v0.3.0 loaded");
+    log::info("Auto Trajectory v0.4.0 loaded");
 }
