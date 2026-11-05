@@ -1,3 +1,20 @@
+# v0.7.0 — Adaptive Performance & Advanced Controls
+
+- Added Ultra Low, Low, Balanced and High performance presets to the floating panel.
+- Added Adaptive Budget and Jump Protection controls, plus live frame/budget telemetry.
+- Jump edges start a short grace period that defers non-critical trajectory preview work.
+- Frame hitches temporarily suspend preview work; Auto Play's live decision path and cached/current input handling remain active.
+- Throttled trajectory preview refresh and skip redundant predictive passes when Auto Play is disabled.
+- Capped simulation lookahead by performance preset and restrict deep Wave search to High/Custom outside jump grace.
+- Expanded the draggable panel and updated its header touch region for the taller layout.
+- Added portable scheduler tests to the offline test suite.
+
+### Limitations
+- Full-level scanning is still synchronous during level initialization.
+- Global route planning and checkpoint-isolated physics simulation are not implemented yet.
+- Static fingerprint cache and incremental-work helpers are included and tested but not yet connected to the live scanner/planner.
+- This is not an Android-device performance guarantee; a Geode Android build and in-game profiling are still required.
+
 # v0.6.0
 
 - Split portable simulation logic into `src/core/Simulation.hpp` and added `src/core/LevelScan.hpp` for level object indexing.
@@ -190,3 +207,14 @@
 - Trajectory draws a marker where the simulated player crashes.
 - Auto play is disabled in dual mode and platformer levels (sim only
   tracks player 1).
+
+
+## v0.7.0
+- Adaptive performance scheduler and advanced floating controls.
+
+## v0.7.0-D (development)
+- Added bounded checkpoint-segment window and segment scoring primitives.
+- Added a four-checkpoint beam-search global route planner that consumes measured per-segment simulation risk (not static object density).
+- Replaced the old fixed Wave correction list with Wave Planner 2.0 candidate generation: frame-aligned one- and two-switch sequences, capped to 6 candidates in light mode and 12 in deep mode; straight paths are evaluated first.
+- Added offline planning regression tests.
+- Segment and global route planner primitives are currently not connected to live clone simulations; the global planner must not be presented as an active in-game route recommendation until that integration is completed.

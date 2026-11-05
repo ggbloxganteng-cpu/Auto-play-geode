@@ -8,9 +8,9 @@
 	},
 	"id": "yourname.auto-trajectory",
 	"name": "Auto Trajectory",
-	"version": "v0.6.0",
+	"version": "v0.7.0-D",
 	"developer": "yourname",
-	"description": "Predictive auto play with a four-zone level pre-scan, route telemetry and a draggable in-game control panel.",
+	"description": "Wave Planner 2.0 and bounded planning primitives for checkpoint segments and global route search.",
 	"links": {
 		"source": "https://github.com/yourname/auto-trajectory"
 	},
@@ -64,7 +64,7 @@
 		"wave-room-aware": {
 			"type": "bool",
 			"name": "Wave: Predictive Path Planner",
-			"description": "Lightweight frame-aligned Wave search with four bounded candidates over a 108-step horizon. Search breadth is reduced; results vary by corridor. Experimental and disabled by default.",
+			"description": "Wave Planner 2.0: frame-aligned one/two-switch candidate search. Straight paths are tested first; deeper candidates are bounded and opt-in.",
 			"default": false
 		},
 		"ui-title": {
@@ -76,6 +76,41 @@
 			"name": "Show Floating Controls",
 			"description": "Shows a draggable, collapsible in-game panel for Auto Play, Trajectory, Wave Planner and route scan status.",
 			"default": true
+		},
+		"performance-title": {
+			"type": "title",
+			"name": "Performance"
+		},
+		"performance-preset": {
+			"type": "int",
+			"name": "Performance Preset",
+			"description": "Ultra Low, Low, Balanced or High. Lower presets cap predictive lookahead to reduce frame spikes.",
+			"default": 1,
+			"min": 0,
+			"max": 3,
+			"control": {
+				"slider": false,
+				"arrows": true,
+				"arrow-step": 1
+			}
+		},
+		"adaptive-budget": {
+			"type": "bool",
+			"name": "Adaptive Budget",
+			"description": "Reduce background prediction work when frame time rises.",
+			"default": true
+		},
+		"jump-protection": {
+			"type": "bool",
+			"name": "Jump Protection",
+			"description": "Temporarily defer visual trajectory refresh after a jump input edge.",
+			"default": true
+		},
+		"performance-diagnostics": {
+			"type": "bool",
+			"name": "Performance Diagnostics",
+			"description": "Enable additional performance telemetry.",
+			"default": false
 		},
 		"debug-title": {
 			"type": "title",
@@ -90,7 +125,19 @@
 		"wave-deep-search": {
 			"type": "bool",
 			"name": "Wave: Deeper Search",
-			"description": "Uses four correction probes after the two straight paths fail and extends the horizon to 144 steps (six total candidates). Can help in some tight corridors but costs more CPU; off by default.",
+			"description": "Enable up to 12 Wave Planner 2.0 candidates with two-switch sequences. Higher CPU cost; keep off on low-end devices.",
+			"default": false
+		},
+		"segment-planner": {
+			"type": "bool",
+			"name": "Checkpoint Segment Planner (experimental)",
+			"description": "Enable checkpoint-aware planning hooks when live segment simulation is connected. Current build includes tested planning primitives; continuous simulation remains active.",
+			"default": false
+		},
+		"global-route-planner": {
+			"type": "bool",
+			"name": "Global Route Planner (experimental)",
+			"description": "Four-checkpoint beam-search core. Requires live segment simulation results before it can recommend or control a route.",
 			"default": false
 		}
 	}

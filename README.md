@@ -83,3 +83,12 @@ geode build
 - Orb support focuses on standard ring instances. Custom/event-linked ring behavior, arbitrary group triggers and teleport-orb destination state may still be missed.
 - The floating panel is a lightweight touch-drag panel, not a full QOLMod/Eclipse-style tabbed settings framework. Detailed numeric tuning remains in Geode settings.
 - The included offline physics is a toy harness. In-game behavior must still be tested on actual Geometry Dash 2.2081.
+
+
+## v0.7.0 performance update
+
+The floating panel now includes performance preset and adaptive-budget controls.
+Ultra Low/Low presets reduce predictive lookahead, visual trajectory refresh is throttled,
+and jump/frame-hitch grace defers non-critical preview work. Auto Play's live decision
+path remains active. The current full-level object scan is still synchronous, so this is
+not yet a complete incremental scanner/global planner release.
