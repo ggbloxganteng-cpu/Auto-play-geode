@@ -52,6 +52,7 @@ namespace {
     bool g_simulating = false;
     bool g_simDead = false;
     bool g_simPortal = false;
+    bool g_simInputDown = false;
     PlayerObject* g_simDummies[2] = {nullptr, nullptr};
 
     // Objects touched by a predictive clone are snapshotted and restored after
@@ -82,10 +83,8 @@ namespace {
     constexpr int kImminentSteps = 16;     // hazard this close: stop waiting, jump now if it works
     constexpr int kShortExtra = 100;       // fallback horizon: just past the first hazard
     constexpr int kTapProbeBack = 35;      // probe a tap this many substeps before the first hazard
-    constexpr int kTapBudgetSteps = 180;   // max substeps an in-flight tap may wait for its landing
     constexpr int kFlySwitchMargin = 2;    // flying: switch input only if clearly better (anti-flap)
-    constexpr int kWaveMaxSteps = 160;     // bounded planning horizon for the multi-pattern wave search
-    constexpr int kWaveRoomOffsetA = 8;    // robustness probe: small vertical perturbations
+    constexpr int kWaveMaxSteps = 192;     // bounded wave-planning horizon (~0.8 s at 240 Hz)
 
     const cocos2d::ccColor4F kNoColor{0.f, 0.f, 0.f, 0.f};
 
@@ -131,6 +130,10 @@ namespace {
 
     bool isFlyingMode(PlayerObject* p) {
         return p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
+    }
+
+    bool isBallMode(PlayerObject* p) {
+        return p && p->m_isBall;
     }
 
     void resetCollisionLog(PlayerObject* p) {
@@ -211,6 +214,13 @@ namespace {
         return false;
     }
 
+    // A normal orb is not an automatic collision bonus: the player must be
+    // pressing Jump when its hitbox is reached. This gate deliberately avoids
+    // treating every RingObject contact as a successful orb activation.
+    bool ringCanActivateForDummy(RingObject* ring, PlayerObject* player, bool inputDown) {
+        return inputDown && ringUnusedByDummy(ring, player);
+    }
+
     bool isSimInteractable(GameObject* object) {
         if (!object) return false;
         // No-Touch can rewrite m_objectType to Decoration. Keep recognising
@@ -281,6 +291,12 @@ static bool requiresFreshPressEdge(BotAction action, bool currentlyHolding) {
     return currentlyHolding && (action == BotAction::Tap || action == BotAction::TimedHold);
 }
 
+static bool advanceTapPulse(int& stepsRemaining, int frameSteps) {
+    if (stepsRemaining <= 0) return true;
+    stepsRemaining -= std::max(1, frameSteps);
+    return stepsRemaining <= 0;
+}
+
 // Everything a simulation needs: the level layer plus one hidden clone per
 // real player (player 2 only exists in dual mode).
 struct SimRig {
@@ -318,6 +334,7 @@ SimResult runSimulation(
     g_simulating = true;
     g_simDead = false;
     g_simPortal = false;
+    g_simInputDown = false;
     g_simObjectSnapshots.clear();
     g_simTouchedObjects.clear();
     g_simDummies[0] = d1;
@@ -344,10 +361,12 @@ SimResult runSimulation(
     auto pressAll = [&]() {
         d1->pushButton(PlayerButton::Jump);
         if (d2) d2->pushButton(PlayerButton::Jump);
+        g_simInputDown = true;
     };
     auto releaseAll = [&]() {
         d1->releaseButton(PlayerButton::Jump);
         if (d2) d2->releaseButton(PlayerButton::Jump);
+        g_simInputDown = false;
     };
     auto anyDead = [&]() {
         return g_simDead || d1->m_isDead || (d2 && d2->m_isDead);
@@ -357,8 +376,7 @@ SimResult runSimulation(
     bool pressed = false;
     bool released = false;
     bool waveInputDown = false;
-    bool tapArmed = false;
-    int tapReleaseCountdown = -1;
+    int tapReleaseStep = -1;
     bool jumped = false;
     int airborneStreak = 0;
 
@@ -391,7 +409,11 @@ SimResult runSimulation(
             if (plan != SimPlan::Release && !pressed && i >= pressDelay) {
                 pressAll();
                 pressed = true;
-                tapArmed = d1->m_isOnGround;
+                if (plan == SimPlan::Tap) {
+                    // Tap is a frame-sized input pulse, whether it is used for
+                    // a grounded jump, a ball flip, or an airborne orb contact.
+                    tapReleaseStep = i + std::max(1, g_frameSubsteps);
+                }
             }
             if (plan == SimPlan::Hold && pressed && !released && holdSteps >= 0 &&
                 i >= pressDelay + holdSteps) {
@@ -428,25 +450,13 @@ SimResult runSimulation(
 
         ++result.survived;
 
-        // A real BotAction::Tap is released at the next postUpdate boundary,
-        // not inside the exact physics substep where takeoff happened. Match
-        // that frame cadence here; otherwise robot jumps are under-predicted
-        // and the live path can rise higher than the selected trajectory.
-        if (plan == SimPlan::Tap && pressed && !released) {
-            if (d1->m_isOnGround) {
-                tapArmed = true;
-                tapReleaseCountdown = -1;
-            } else if (tapArmed) {
-                if (tapReleaseCountdown < 0) {
-                    tapReleaseCountdown = std::max(0, g_frameSubsteps - 1);
-                } else if (tapReleaseCountdown > 0) {
-                    --tapReleaseCountdown;
-                }
-                if (tapReleaseCountdown == 0) {
-                    releaseAll();
-                    released = true;
-                }
-            }
+        // Match the live controller: Tap is a one-rendered-frame pulse. It
+        // must also release while airborne; otherwise an orb tap that did not
+        // cause takeoff can keep Jump locked until the old 180-step timeout.
+        if (plan == SimPlan::Tap && pressed && !released &&
+            tapReleaseStep >= 0 && i + 1 >= tapReleaseStep) {
+            releaseAll();
+            released = true;
         }
 
         // The path reached a portal: what comes after it is not modelled, so
@@ -471,6 +481,7 @@ SimResult runSimulation(
     if (d2) d2->setVisible(false);
 
     g_simulating = false;
+    g_simInputDown = false;
     g_simDummies[0] = nullptr;
     g_simDummies[1] = nullptr;
     return result;
@@ -486,7 +497,7 @@ static SimResult probeWave(SimRig const& rig, WavePlan const& plan, int steps) {
     return runSimulation(rig, SimPlan::WavePattern, 0, -1, steps, 0, nullptr, kNoColor, &plan);
 }
 
-// Cube / ball / robot / spider: jump at the last moment a jump still works.
+// Cube / spider: issue a fresh one-frame jump pulse at a safe window.
 //
 // A jump is judged by simulating it for the whole lookahead (so a jump is
 // chosen that also sets up the NEXT obstacle, e.g. landing on the start of a
@@ -507,55 +518,58 @@ static BotAction decideGround(
         botSteps, std::min(botSteps, idle.survived + kShortExtra)
     };
     int bestNow = 0;
+    BotAction bestNowAction = BotAction::Release;
     int bestWait = 0;
 
     for (int hi = 0; hi < 2; ++hi) {
         const int steps = horizons[hi];
         if (hi == 1 && steps >= botSteps) break;
 
-        // 1. Single tap.
+        // First test the action that can actually be issued now. The previous
+        // implementation returned Release as soon as a delayed tap also
+        // survived, even when Tap-now was already safe. That can defer Cube
+        // jumps indefinitely as the same future window moves forward each frame.
+        SimResult tapNow = probe(rig, SimPlan::Tap, 0, -1, steps);
+        if (tapNow.survived > bestNow) {
+            bestNow = tapNow.survived;
+            bestNowAction = BotAction::Tap;
+        }
+        if (!tapNow.died) return BotAction::Tap;
+
+        // Only postpone when the immediate tap fails but a later window works.
         SimResult tapWait = probe(rig, SimPlan::Tap, waitDelay, -1, steps);
         bestWait = std::max(bestWait, tapWait.survived);
-        if (!tapWait.died) return BotAction::Release;
-
-        // Do not commit to a jump now until we have checked whether a later
-        // tap window also survives. The old order returned Tap immediately
-        // when tapNow survived, so the ahead-window test was unreachable in
-        // exactly the early-jump cases it was meant to prevent.
-        bool laterTapWorks = false;
-        for (int waitFrames = 2; waitFrames <= 5; ++waitFrames) {
+        bool laterTapWorks = !tapWait.died;
+        for (int waitFrames = 2; !laterTapWorks && waitFrames <= 5; ++waitFrames) {
             const int delay = waitFrames * frameSteps + kWaitMarginSteps;
             if (delay <= waitDelay || delay >= idle.survived) continue;
             SimResult delayed = probe(rig, SimPlan::Tap, delay, -1, steps);
-            if (!delayed.died) {
-                laterTapWorks = true;
-                break;
-            }
+            bestWait = std::max(bestWait, delayed.survived);
+            laterTapWorks = !delayed.died;
         }
 
-        // Also check the last useful tap window before the first predicted
-        // collision; this is deliberately evaluated before tapNow.
         const int ahead = idle.survived - kTapProbeBack;
         if (!laterTapWorks && ahead > waitDelay && ahead < steps) {
             SimResult tapAhead = probe(rig, SimPlan::Tap, ahead, -1, steps);
+            bestWait = std::max(bestWait, tapAhead.survived);
             laterTapWorks = !tapAhead.died;
         }
         if (laterTapWorks) return BotAction::Release;
 
-        SimResult tapNow = probe(rig, SimPlan::Tap, 0, -1, steps);
-        bestNow = std::max(bestNow, tapNow.survived);
-        if (!tapNow.died) return BotAction::Tap;
+        // 2. Hold (bunny hop). Prefer it only after a one-frame tap is not
+        // sufficient and no later tap window is currently viable.
+        SimResult holdNow = probe(rig, SimPlan::Hold, 0, -1, steps);
+        if (holdNow.survived > bestNow) {
+            bestNow = holdNow.survived;
+            bestNowAction = BotAction::Hold;
+        }
+        if (!holdNow.died) return BotAction::Hold;
 
-        // 2. Hold (bunny hop).
         bool earlyAtWait = !tapWait.late;
         SimResult holdWait = probe(rig, SimPlan::Hold, waitDelay, -1, steps);
         bestWait = std::max(bestWait, holdWait.survived);
         if (!holdWait.died) return BotAction::Release;
         if (!holdWait.late) earlyAtWait = true;
-
-        SimResult holdNow = probe(rig, SimPlan::Hold, 0, -1, steps);
-        bestNow = std::max(bestNow, holdNow.survived);
-        if (!holdNow.died) return BotAction::Hold;
 
         // Nothing works now or one frame later, but the failures look like
         // "too early": the window is still ahead.
@@ -566,7 +580,7 @@ static BotAction decideGround(
 
     // Nothing survives: only press if it is clearly the longest-lasting option.
     if (bestNow > std::max(idle.survived, bestWait) + kDoomedMargin) {
-        return BotAction::Hold;
+        return bestNowAction;
     }
     return BotAction::Release;
 }
@@ -581,18 +595,15 @@ static BotAction decideRobot(
     if (selectedHoldSteps) *selectedHoldSteps = 0;
     const int frameSteps = std::clamp(g_frameSubsteps, 1, 16);
     const int waitDelay = frameSteps + kWaitMarginSteps;
-    const int frames[] = {1, 2, 3, 4, 6, 8, 10, 12, 16, 20};
-
-    // If the same jump can be postponed one frame and still clear the horizon,
-    // do not jump early. This reduces gratuitous setup jumps.
-    for (int frameCount : frames) {
-        const int holdSteps = frameCount * frameSteps;
-        SimResult wait = probe(rig, SimPlan::Hold, waitDelay, holdSteps, botSteps);
-        if (!wait.died) return BotAction::Release;
-    }
+    // Dense short holds give the Robot more control around low ceilings and
+    // chained platforms; longer holds remain available for tall jumps.
+    const int frames[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24};
 
     int bestSurvived = idle.survived;
     int bestHoldSteps = 0;
+    // Try an immediate hold first. If it already survives the full horizon,
+    // delaying just because a later hold also survives causes the same
+    // never-commit behavior that affected Cube.
     for (int frameCount : frames) {
         const int holdSteps = frameCount * frameSteps;
         SimResult now = probe(rig, SimPlan::Hold, 0, holdSteps, botSteps);
@@ -604,6 +615,14 @@ static BotAction decideRobot(
             bestSurvived = now.survived;
             bestHoldSteps = holdSteps;
         }
+    }
+
+    // When every immediate hold fails, see whether waiting a frame opens a
+    // viable jump window before committing to a partial best-effort action.
+    for (int frameCount : frames) {
+        const int holdSteps = frameCount * frameSteps;
+        SimResult wait = probe(rig, SimPlan::Hold, waitDelay, holdSteps, botSteps);
+        if (!wait.died) return BotAction::Release;
     }
 
     if (bestHoldSteps > 0 && bestSurvived > idle.survived + kDoomedMargin) {
@@ -676,32 +695,23 @@ static BotAction decideWaveClassic(
     return currentlyHolding ? BotAction::Hold : BotAction::Release;
 }
 
-// Wave planner: test short multi-switch sequences instead of only comparing
-// permanent hold/release or a single switch. A small robustness pass favors
-// paths that still survive when the starting Y position is perturbed.
+// Wave planner: test frame-aligned one- and two-correction sequences instead
+// of only comparing permanent hold/release. It remains opt-in because of cost.
 static BotAction decideWave(
     SimRig const& rig, SimResult const& idle, int lookahead, bool currentlyHolding,
     WavePlan* selectedPlan = nullptr
 ) {
     if (selectedPlan) *selectedPlan = WavePlan{};
     const int botSteps = std::min(lookahead, kWaveMaxSteps);
-
-    // In open space both straight inputs are safe. Do not perturb a stable
-    // wave line merely because a more complicated sequence also survives.
-    SimResult holdStraight = probe(rig, SimPlan::Hold, 0, -1, botSteps);
-    if (!idle.died && idle.survived >= botSteps &&
-        !holdStraight.died && holdStraight.survived >= botSteps) {
-        return currentlyHolding ? BotAction::Hold : BotAction::Release;
-    }
+    const int frameSteps = std::clamp(g_frameSubsteps, 1, 8);
 
     struct Candidate {
         WavePlan plan;
         bool alive = false;
         int survived = 0;
-        int roomPasses = -1;
         int switches = 0;
     };
-    Candidate candidates[12];
+    Candidate candidates[10];
     int count = 0;
     auto add = [&](bool startHold, std::initializer_list<int> changes) {
         if (count >= static_cast<int>(std::size(candidates))) return;
@@ -717,97 +727,89 @@ static BotAction decideWave(
         candidate.switches = candidate.plan.switchCount;
     };
 
-    // Stable paths and one-switch timing windows.
-    add(false, {});
-    add(true, {});
-    for (int at : {16, 32, 48}) {
-        add(false, {at});
-        add(true, {at});
-    }
-
-    // A second switch permits a recovery turn after the first correction.
-    add(false, {12, 32});
-    add(true, {12, 32});
-
-    // One compact pulse train handles passages that require repeated changes.
-    for (bool startHold : {false, true}) {
-        WavePlan plan;
-        plan.startHolding = startHold;
-        for (int at = 12; at < botSteps && plan.switchCount < 8; at += 12) {
-            plan.switchSteps[plan.switchCount++] = at;
-        }
-        Candidate& candidate = candidates[count++];
-        candidate.plan = plan;
-        candidate.switches = plan.switchCount;
-    }
+    const bool opposite = !currentlyHolding;
+    // Straight paths, single corrections in either direction, and two-switch
+    // recovery patterns. This wider search is optional because it costs several
+    // times more simulation work than the classic hold/release controller.
+    add(currentlyHolding, {});
+    add(opposite, {});
+    add(currentlyHolding, {1 * frameSteps});
+    add(currentlyHolding, {2 * frameSteps});
+    add(opposite, {1 * frameSteps});
+    add(opposite, {2 * frameSteps});
+    add(currentlyHolding, {1 * frameSteps, 3 * frameSteps});
+    add(currentlyHolding, {2 * frameSteps, 4 * frameSteps});
+    add(opposite, {1 * frameSteps, 3 * frameSteps});
+    add(opposite, {2 * frameSteps, 4 * frameSteps});
 
     bool anyAlive = false;
+    int bestIndex = -1;
     int bestHoldSurvival = 0;
     int bestReleaseSurvival = 0;
     for (int i = 0; i < count; ++i) {
         SimResult result = probeWave(rig, candidates[i].plan, botSteps);
-        candidates[i].alive = !result.died;
-        candidates[i].survived = result.survived;
-        anyAlive = anyAlive || candidates[i].alive;
-        if (candidates[i].plan.startHolding) {
+        Candidate& candidate = candidates[i];
+        candidate.alive = !result.died;
+        candidate.survived = result.survived;
+        anyAlive = anyAlive || candidate.alive;
+        if (candidate.plan.startHolding) {
             bestHoldSurvival = std::max(bestHoldSurvival, result.survived);
         } else {
             bestReleaseSurvival = std::max(bestReleaseSurvival, result.survived);
         }
-    }
 
-    if (!anyAlive) {
-        if (bestHoldSurvival > bestReleaseSurvival + kFlySwitchMargin) return BotAction::Hold;
-        if (bestReleaseSurvival > bestHoldSurvival + kFlySwitchMargin) return BotAction::Release;
-        return currentlyHolding ? BotAction::Hold : BotAction::Release;
-    }
-
-    // Evaluate only the best two survivors with a small vertical perturbation;
-    // this bounds CPU use on mobile while still rejecting fragile trajectories.
-    for (int pass = 0; pass < 2; ++pass) {
-        int bestIndex = -1;
-        for (int i = 0; i < count; ++i) {
-            if (!candidates[i].alive || candidates[i].roomPasses >= 0) continue;
-            if (bestIndex < 0 || candidates[i].survived > candidates[bestIndex].survived ||
-                (candidates[i].survived == candidates[bestIndex].survived &&
-                 candidates[i].switches < candidates[bestIndex].switches)) {
-                bestIndex = i;
-            }
-        }
-        if (bestIndex < 0) break;
-        Candidate& candidate = candidates[bestIndex];
-        candidate.roomPasses = 0;
-        SimRig up = rig;
-        SimRig down = rig;
-        up.yOffset = static_cast<float>(kWaveRoomOffsetA);
-        down.yOffset = -static_cast<float>(kWaveRoomOffsetA);
-        if (!probeWave(up, candidate.plan, botSteps).died) ++candidate.roomPasses;
-        if (!probeWave(down, candidate.plan, botSteps).died) ++candidate.roomPasses;
-    }
-
-    int bestIndex = -1;
-    for (int i = 0; i < count; ++i) {
-        Candidate const& candidate = candidates[i];
         if (!candidate.alive) continue;
         if (bestIndex < 0) {
             bestIndex = i;
             continue;
         }
         Candidate const& best = candidates[bestIndex];
-        bool better = candidate.roomPasses > best.roomPasses;
-        if (candidate.roomPasses == best.roomPasses) {
-            if (candidate.survived > best.survived) better = true;
-            else if (candidate.survived == best.survived && candidate.switches < best.switches) better = true;
-            else if (candidate.survived == best.survived && candidate.switches == best.switches &&
+        bool better = candidate.survived > best.survived;
+        if (candidate.survived == best.survived) {
+            if (candidate.switches < best.switches) better = true;
+            else if (candidate.switches == best.switches &&
                      candidate.plan.startHolding == currentlyHolding &&
                      best.plan.startHolding != currentlyHolding) better = true;
         }
         if (better) bestIndex = i;
     }
 
-    if (bestIndex < 0) return currentlyHolding ? BotAction::Hold : BotAction::Release;
+    if (!anyAlive || bestIndex < 0) {
+        if (bestHoldSurvival > bestReleaseSurvival + kFlySwitchMargin) return BotAction::Hold;
+        if (bestReleaseSurvival > bestHoldSurvival + kFlySwitchMargin) return BotAction::Release;
+        return currentlyHolding ? BotAction::Hold : BotAction::Release;
+    }
+
     if (selectedPlan) *selectedPlan = candidates[bestIndex].plan;
     return candidates[bestIndex].plan.startHolding ? BotAction::Hold : BotAction::Release;
+}
+
+// Ball is an edge-triggered gravity switch, not a variable-height jump. Probe
+// one-frame flips at several future windows; never leave Jump held as a way to
+// request repeated ball flips.
+static BotAction decideBall(SimRig const& rig, SimResult const& idle, int botSteps) {
+    if (!(idle.died && idle.survived < botSteps)) return BotAction::Release;
+    const int frameSteps = std::clamp(g_frameSubsteps, 1, 16);
+
+    SimResult now = probe(rig, SimPlan::Tap, 0, -1, botSteps);
+    if (!now.died) return BotAction::Tap;
+
+    int bestSurvived = std::max(idle.survived, now.survived);
+    // If an immediate flip is not enough, try upcoming frame-aligned windows.
+    // Return Release only when a later flip really outlives the current one.
+    for (int waitFrames = 1; waitFrames <= 4; ++waitFrames) {
+        const int delay = waitFrames * frameSteps;
+        if (delay >= idle.survived || delay >= botSteps) break;
+        SimResult later = probe(rig, SimPlan::Tap, delay, -1, botSteps);
+        if (!later.died) return BotAction::Release;
+        bestSurvived = std::max(bestSurvived, later.survived);
+    }
+
+    // Even a partial improvement matters in Ball: this pulse changes gravity,
+    // then the controller gets another decision window after the flip.
+    if (now.survived > idle.survived + kDoomedMargin &&
+        now.survived >= bestSurvived) return BotAction::Tap;
+    return BotAction::Release;
 }
 
 // Decides what the bot should do this frame.
@@ -824,6 +826,11 @@ BotAction decideAutoPress(
         }
         if (selectedWavePlan) *selectedWavePlan = WavePlan{};
         return decideWaveClassic(rig, idle, botSteps, currentlyHolding);
+    }
+
+    // Ball flips gravity on a fresh input edge, so it needs its own pulse planner.
+    if (isBallMode(p)) {
+        return decideBall(rig, idle, botSteps);
     }
 
     // Nothing dangerous inside the lookahead window: stay released.
@@ -905,7 +912,7 @@ class $modify(AutoTrajBaseLayer, GJBaseGameLayer) {
             // the per-player activation flag in dual mode. The real game path
             // is untouched because this branch only runs during prediction.
             if (auto* ring = typeinfo_cast<RingObject*>(object)) {
-                return ringUnusedByDummy(ring, player);
+                return ringCanActivateForDummy(ring, player, g_simInputDown);
             }
         }
         return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
@@ -996,8 +1003,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         int waveStepsUntilTransition = 0;
         bool waveTransitionTarget = false;
         bool botTapActive = false;
-        bool botTapGrounded = false;
-        int botTapBudget = 0;
+        int botTapStepsRemaining = 0;
         bool timedHoldActive = false;
         int timedHoldStepsRemaining = 0;
         bool timedHoldRobotMode = false;
@@ -1045,8 +1051,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         this->setupMenu();
         m_fields->botHolding = false;
         m_fields->botTapActive = false;
-        m_fields->botTapGrounded = false;
-        m_fields->botTapBudget = 0;
+        m_fields->botTapStepsRemaining = 0;
         m_fields->timedHoldActive = false;
         m_fields->timedHoldStepsRemaining = 0;
         m_fields->timedHoldRobotMode = false;
@@ -1113,8 +1118,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 
     void cancelTap() {
         m_fields->botTapActive = false;
-        m_fields->botTapGrounded = false;
-        m_fields->botTapBudget = 0;
+        m_fields->botTapStepsRemaining = 0;
     }
 
     void cancelWaveTransition() {
@@ -1272,7 +1276,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                 if (m_fields->timedHoldStepsRemaining <= 0) {
                     this->releaseBot();
                     this->cancelTimedHold();
-                    timedHoldJustReleased = true;
+                    // Re-plan in this same postUpdate. Skipping one extra frame
+                    // here can miss a chained Robot jump or a landing window.
                 } else {
                     timedHoldForced = true;
                 }
@@ -1305,21 +1310,13 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             );
         }
 
-        // Finish an in-flight tap before anything else: the simulation that
-        // validated it assumes the press begins from a released button and
-        // remains down until the first takeoff. Releasing earlier desyncs it.
-        bool tapForcedHold = false;
-        if (m_fields->botTapActive) {
-            if (m_player1->m_isOnGround) {
-                m_fields->botTapGrounded = true;
-            }
-            m_fields->botTapBudget -= std::max(1, g_frameSubsteps);
-            bool launched = m_fields->botTapGrounded && !m_player1->m_isOnGround;
-            if (launched || m_fields->botTapBudget <= 0) {
-                this->cancelTap();
-            } else {
-                tapForcedHold = true;
-            }
+        // Every Tap is a single-frame pulse. Release it at this frame boundary
+        // and re-plan from the actual player state; do not hold indefinitely
+        // while waiting for a landing or a takeoff that may never happen.
+        if (m_fields->botTapActive &&
+            advanceTapPulse(m_fields->botTapStepsRemaining, g_frameSubsteps)) {
+            this->releaseBot();
+            this->cancelTap();
         }
 
         if (autoOn) {
@@ -1334,8 +1331,6 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                 action = BotAction::Hold;
             } else if (timedHoldJustReleased) {
                 action = BotAction::Release;
-            } else if (tapForcedHold) {
-                action = BotAction::Hold;
             } else if (scheduledWave && m_fields->waveTransitionActive) {
                 // Execute the first planned switch at a frame boundary. Recheck
                 // the current straight segment; cancel the schedule if the live
@@ -1359,7 +1354,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                 }
             }
 
-            if (!timedHoldForced && !timedHoldJustReleased && !tapForcedHold &&
+            if (!timedHoldForced && !timedHoldJustReleased &&
                 !waveDidSwitch && (!scheduledWave || !m_fields->waveTransitionActive)) {
                 WavePlan selectedWavePlan;
                 action = decideAutoPress(
@@ -1381,15 +1376,17 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                     (hazard && m_fields->logFrame % 15 == 0)) {
                     m_fields->lastLoggedAction = static_cast<int>(action);
                     log::info(
-                        "[AT] f={} x={:.0f} y={:.0f} gnd={} up={} mode={}{}{}{}{} dual={} "
-                        "idle(died={} surv={}) tap={} action={}",
+                        "[AT] f={} x={:.0f} y={:.0f} gnd={} up={} mode={} dual={} "
+                        "idle(died={} surv={}) tapPulse={} tapLeft={} robotHold={} action={}",
                         m_fields->logFrame, m_player1->getPositionX(), m_player1->getPositionY(),
                         m_player1->m_isOnGround, m_player1->m_isUpsideDown,
-                        m_player1->m_isShip ? "ship" : "", m_player1->m_isBird ? "ufo" : "",
-                        m_player1->m_isDart ? "wave" : "", m_player1->m_isSwing ? "swing" : "",
-                        (!isFlyingMode(m_player1)) ? "ground" : "",
+                        m_player1->m_isBall ? "ball" : (m_player1->m_isRobot ? "robot" :
+                            (m_player1->m_isShip ? "ship" : (m_player1->m_isBird ? "ufo" :
+                            (m_player1->m_isDart ? "wave" : (m_player1->m_isSwing ? "swing" :
+                            (m_player1->m_isSpider ? "spider" : "cube")))))),
                         rig.dummy2 != nullptr, idleResult.died, idleResult.survived,
-                        m_fields->botTapActive, static_cast<int>(action)
+                        m_fields->botTapActive, m_fields->botTapStepsRemaining,
+                        m_fields->timedHoldStepsRemaining, static_cast<int>(action)
                     );
                 }
             }
@@ -1421,11 +1418,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                     // left Jump down; otherwise an orb/cube tap is swallowed.
                     if (requiresFreshPressEdge(action, m_fields->botHolding)) this->releaseBot();
                     this->pressBot();
-                    if (!m_fields->botTapActive) {
-                        m_fields->botTapActive = true;
-                        m_fields->botTapGrounded = m_player1->m_isOnGround;
-                        m_fields->botTapBudget = kTapBudgetSteps;
-                    }
+                    m_fields->botTapActive = true;
+                    m_fields->botTapStepsRemaining = std::max(1, g_frameSubsteps);
                     break;
                 case BotAction::Release:
                 default:
@@ -1460,5 +1454,5 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 };
 
 $on_mod(Loaded) {
-    log::info("Auto Trajectory v0.5.2 loaded");
+    log::info("Auto Trajectory v0.5.4 loaded");
 }
