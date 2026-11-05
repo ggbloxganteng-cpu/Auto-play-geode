@@ -1,3 +1,14 @@
+# v0.7.0-D (panel update)
+
+- Floating panel widened to 210 px; geometry now lives in shared constants (`at::ui::kPanel*`) so layout and touch hit-area can't drift apart.
+- Menu buttons enlarged (scale 0.68 -> 0.78, padding 1 -> 3) for easier phone taps.
+- ON/OFF states are tinted green/red (Auto Play, Trajectory, Wave Plan, Adaptive Budget).
+- Panel position and fold state are remembered between levels/sessions and clamped to the screen.
+- Folded panel now shows a one-line status (Auto / Path / preset) so you don't need to unfold it.
+- Clearer labels: header hint [-]/[+], "Wave Assist", "Auto-save FPS", "Performance: <preset> >", and a plain FPS readout (JUMP SAFE shown when active).
+- All panel text now goes through one `refreshPanelLabels()` so labels can't go out of sync.
+- Not compiled against Geode here (no SDK/network in sandbox); offline logic tests still pass.
+
 # v0.7.0 — Adaptive Performance & Advanced Controls
 
 - Added Ultra Low, Low, Balanced and High performance presets to the floating panel.
