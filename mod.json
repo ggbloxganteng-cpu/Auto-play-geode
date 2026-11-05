@@ -8,7 +8,7 @@
 	},
 	"id": "yourname.auto-trajectory",
 	"name": "Auto Trajectory",
-	"version": "v0.5.0",
+	"version": "v0.5.2",
 	"developer": "yourname",
 	"description": "Auto play bot with a live jump trajectory overlay.",
 	"links": {
@@ -22,7 +22,7 @@
 		"auto-play": {
 			"type": "bool",
 			"name": "Auto Play",
-			"description": "Plays for you: jumps at the last safe moment (cube/ball), steers ship/UFO/swing/wave, and handles dual mode. Not available in platformer levels.",
+			"description": "Predictive auto play for cube/robot/ball, ship/UFO/swing/wave and dual mode. Tap input edges are synchronized with prediction; robot holds are frame-timed. Not available in platformer levels.",
 			"default": false
 		},
 		"show-trajectory": {

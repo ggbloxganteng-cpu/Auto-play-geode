@@ -1,3 +1,30 @@
+# v0.5.2
+
+- Check later tap windows before selecting an immediate Cube jump, reducing avoidable early jumps.
+- Force a fresh press edge when Tap is selected while the bot still holds Jump, keeping live input aligned with the released-then-pressed simulation and allowing orb taps after a hold.
+- Admit standard RingObject activation in the hidden clone even when the base layer rejects the unregistered dummy player; respect per-player orb-used flags and restore object state afterward.
+- Treat teleport orbs as simulation boundaries rather than attempting to predict their linked destination.
+- Keep timed variable holds limited to Robot mode; bounded Cube hold tests regressed randomized layouts and were not retained.
+- Expand the offline controller harness to model fresh tap edges and timed Robot hold scheduling.
+
+# v0.5.1
+
+- Fixed a simulator/live-input timing mismatch: tap prediction now keeps the
+  input through the same postUpdate frame boundary as the real controller.
+  This matters especially for robot mode, where holding for even a few more
+  physics steps changes jump height.
+- Added robot-specific variable-height jump planning. It tests bounded,
+  frame-aligned hold durations, waits when a later jump remains safe, and
+  releases at the scheduled frame boundary so the next landing can be planned
+  as a separate jump rather than leaving Jump held indefinitely.
+- Orb detection now also checks the runtime `RingObject` class. This avoids
+  losing ring/orb collisions when No-Touch rewrites `m_objectType` to
+  `Decoration`; ordinary pad detection is unchanged.
+- Added offline checks for Decoration-typed orb instances, tap release cadence,
+  and finite robot hold duration.
+- This is still a heuristic controller. Event-linked/custom orb effects and
+  arbitrary group triggers remain muted during prediction.
+
 # v0.5.0
 
 - Simulation now passes common jump pads and ring/orb object types into the
