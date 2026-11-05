@@ -34,7 +34,7 @@ namespace at::ui {
         void registerWithTouchDispatcher() override {
             // CCMenu uses -128. Register just after it so its buttons keep
             // normal click behavior while the otherwise-empty header can drag.
-            cocos2d::CCTouchDispatcher::sharedDispatcher()
+            cocos2d::CCTouchDispatcher::get()
                 ->addTargetedDelegate(this, -127, true);
         }
 
