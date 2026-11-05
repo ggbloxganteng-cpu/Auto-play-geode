@@ -7,32 +7,11 @@
 #include <Geode/modify/GameObject.hpp>
 
 #include <algorithm>
+#include <cmath>
 
 using namespace geode::prelude;
 
 namespace {
-    bool g_simulating = false;
-    bool g_simDead = false;
-    PlayerObject* g_simDummy = nullptr;
-    float g_stepDt = 0.25f;
-    bool g_warnedStepZero = false;
-
-    // Player-1 physics substeps seen since the last postUpdate, and the
-    // substeps-per-frame value measured from it (used to time the jump).
-    int g_stepCounter = 0;
-    int g_frameSubsteps = 4;
-
-    // Simulation tuning, all in physics substeps (240 per second).
-    constexpr int kJumpAirborneSteps = 15; // consecutive airborne substeps that count as a real jump
-    constexpr int kLandSettleSteps = 16;   // consecutive grounded substeps after a jump = landed safely
-    constexpr int kWaitMarginSteps = 2;    // safety margin when deciding to wait for a later jump
-    constexpr int kDoomedMargin = 4;       // when nothing survives, press only if clearly better
-    constexpr int kImminentSteps = 16;     // hazard this close: stop waiting, jump now if it works
-    constexpr int kTapBudgetSteps = 180;   // max substeps an in-flight tap may wait for its landing
-    constexpr int kFlySwitchMargin = 2;    // ship/wave: switch input only if clearly better (anti-flap)
-
-    const cocos2d::ccColor4F kNoColor{0.f, 0.f, 0.f, 0.f};
-
     bool autoPlayEnabled() {
         return Mod::get()->getSettingValue<bool>("auto-play");
     }
@@ -45,12 +24,75 @@ namespace {
         return Mod::get()->getSettingValue<bool>("show-ui");
     }
 
+    bool waveRoomAwareEnabled() {
+        return Mod::get()->getSettingValue<bool>("wave-room-aware");
+    }
+
+    bool debugLogEnabled() {
+        return Mod::get()->getSettingValue<bool>("debug-log");
+    }
+
     int trajectorySteps() {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("trajectory-steps"));
     }
 
     int autoPlayLookahead() {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("autoplay-lookahead"));
+    }
+}
+
+// ---- BEGIN PORTABLE LOGIC (also compiled by the offline test harness) ----
+namespace {
+    bool g_simulating = false;
+    bool g_simDead = false;
+    bool g_simPortal = false;
+    PlayerObject* g_simDummies[2] = {nullptr, nullptr};
+    float g_stepDt = 0.25f;
+    bool g_warnedStepZero = false;
+
+    // Player-1 physics substeps seen since the last postUpdate, and the
+    // substeps-per-frame value measured from it (used to time the jump).
+    int g_stepCounter = 0;
+    int g_frameSubsteps = 4;
+    long long g_simStepCount = 0; // total simulated substeps (cost statistics)
+
+    // Simulation tuning, all in physics substeps (240 per second).
+    constexpr int kWaitMarginSteps = 2;    // safety margin when deciding to wait for a later jump
+    constexpr int kDoomedMargin = 4;       // when nothing survives, press only if clearly better
+    constexpr int kImminentSteps = 16;     // hazard this close: stop waiting, jump now if it works
+    constexpr int kShortExtra = 100;       // fallback horizon: just past the first hazard
+    constexpr int kTapProbeBack = 35;      // probe a tap this many substeps before the first hazard
+    constexpr int kTapBudgetSteps = 180;   // max substeps an in-flight tap may wait for its landing
+    constexpr int kFlySwitchMargin = 2;    // flying: switch input only if clearly better (anti-flap)
+    constexpr int kWaveMaxSteps = 160;     // wave planning horizon cap (keeps the many candidate sims cheap)
+    constexpr int kWavePulseA = 14;        // wave candidates: switch input after this many substeps
+    constexpr int kWavePulseB = 40;
+
+    const cocos2d::ccColor4F kNoColor{0.f, 0.f, 0.f, 0.f};
+
+    bool isSimDummy(PlayerObject* p) {
+        return p && (p == g_simDummies[0] || p == g_simDummies[1]);
+    }
+
+    // Gravity / mode / size / dual / speed / teleport portals (object ids).
+    bool isPortalId(int id) {
+        switch (id) {
+            case 10: case 11:                    // gravity
+            case 12: case 13: case 47: case 111: // cube, ship, ball, ufo
+            case 660: case 745: case 1331: case 1933: // wave, robot, spider, swing
+            case 99: case 101:                   // size
+            case 286: case 287:                  // dual
+            case 200: case 201: case 202: case 203: case 1334: // speed
+            case 747: case 2926:                 // teleport, gravity toggle
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool nearPortal(PlayerObject* player, GameObject* portal) {
+        return std::fabs(player->getPositionX() - portal->getPositionX()) < 20.f &&
+               std::fabs(player->getPositionY() - portal->getPositionY()) < 60.f;
     }
 
     bool isFlyingMode(PlayerObject* p) {
@@ -97,89 +139,141 @@ struct SimResult {
 
 enum class SimPlan {
     Release, // never press
-    Hold,    // press after the delay and keep holding (cube keeps bunny hopping)
+    Hold,    // press after the delay; hold forever (or for holdSteps)
     Tap      // press after the delay, let go as soon as the player has left the ground
 };
 
-// What the bot should physically do this frame. The whole point of the bot is
-// that the REAL input mirrors the plan the simulation validated; anything else
-// desyncs the sim from reality (the original "jumps only once" bug).
+// What the bot should physically do this frame. The REAL input mirrors the
+// plan the simulation validated; anything else desyncs sim and reality.
 enum class BotAction {
     Release,
     Hold,
     Tap
 };
 
+// Everything a simulation needs: the level layer plus one hidden clone per
+// real player (player 2 only exists in dual mode).
+struct SimRig {
+    PlayLayer* pl = nullptr;
+    PlayerObject* dummy = nullptr;
+    PlayerObject* source = nullptr;
+    PlayerObject* dummy2 = nullptr;
+    PlayerObject* source2 = nullptr;
+    float dt = 0.25f;
+    float yOffset = 0.f; // shift the clones vertically to test how much room a path has
+    bool roomAwareWave = false; // experimental wave controller (setting)
+};
+
 SimResult runSimulation(
-    PlayLayer* pl,
-    PlayerObject* dummy,
-    PlayerObject* source,
+    SimRig const& rig,
     SimPlan plan,
     int pressDelay,
+    int holdSteps, // Hold only: release this many substeps after pressing (<0 = never)
     int maxSteps,
     int drawSteps,
-    float dt,
     cocos2d::CCDrawNode* draw,
     cocos2d::ccColor4F color
 ) {
     SimResult result;
-    if (!pl || !dummy || !source || maxSteps <= 0) {
+    PlayLayer* pl = rig.pl;
+    PlayerObject* d1 = rig.dummy;
+    PlayerObject* s1 = rig.source;
+    PlayerObject* d2 = (rig.dummy2 && rig.source2) ? rig.dummy2 : nullptr;
+    if (!pl || !d1 || !s1 || maxSteps <= 0) {
         return result;
     }
+    const float dt = rig.dt;
 
     g_simulating = true;
     g_simDead = false;
-    g_simDummy = dummy;
+    g_simPortal = false;
+    g_simDummies[0] = d1;
+    g_simDummies[1] = d2;
 
-    syncDummy(dummy, source);
+    syncDummy(d1, s1);
+    resetCollisionLog(d1);
+    d1->releaseButton(PlayerButton::Jump);
+    if (d2) {
+        syncDummy(d2, rig.source2);
+        resetCollisionLog(d2);
+        d2->releaseButton(PlayerButton::Jump);
+    }
 
-    resetCollisionLog(dummy);
-    dummy->releaseButton(PlayerButton::Jump);
+    if (rig.yOffset != 0.f) {
+        auto p1 = d1->getPosition();
+        d1->setPosition(cocos2d::CCPoint(p1.x, p1.y + rig.yOffset));
+        if (d2) {
+            auto p2 = d2->getPosition();
+            d2->setPosition(cocos2d::CCPoint(p2.x, p2.y + rig.yOffset));
+        }
+    }
 
-    const bool flying = isFlyingMode(source);
+    auto pressAll = [&]() {
+        d1->pushButton(PlayerButton::Jump);
+        if (d2) d2->pushButton(PlayerButton::Jump);
+    };
+    auto releaseAll = [&]() {
+        d1->releaseButton(PlayerButton::Jump);
+        if (d2) d2->releaseButton(PlayerButton::Jump);
+    };
+    auto anyDead = [&]() {
+        return g_simDead || d1->m_isDead || (d2 && d2->m_isDead);
+    };
+
+    const bool flying = isFlyingMode(s1);
     bool pressed = false;
-    bool tapDone = false;
+    bool released = false;
     bool tapArmed = false;
     bool jumped = false;
     int airborneStreak = 0;
-    int landedStreak = 0;
 
-    cocos2d::CCPoint previous = dummy->getPosition();
+    cocos2d::CCPoint previous = d1->getPosition();
 
     auto markDeath = [&](int step) {
         result.died = true;
-        result.deathPos = dummy->getPosition();
+        result.deathPos = d1->getPosition();
         result.late = !flying && !(
-            airborneStreak >= kJumpAirborneSteps || (jumped && dummy->m_isOnGround)
+            airborneStreak >= 15 || (jumped && d1->m_isOnGround)
         );
         if (draw && step <= drawSteps) {
-            draw->drawDot(dummy->getPosition(), 4.f, color);
+            draw->drawDot(d1->getPosition(), 4.f, color);
         }
     };
 
     for (int i = 0; i < maxSteps; ++i) {
+        ++g_simStepCount;
         if (plan != SimPlan::Release && !pressed && i >= pressDelay) {
-            dummy->pushButton(PlayerButton::Jump);
+            pressAll();
             pressed = true;
-            tapArmed = dummy->m_isOnGround;
+            tapArmed = d1->m_isOnGround;
+        }
+        if (plan == SimPlan::Hold && pressed && !released && holdSteps >= 0 &&
+            i >= pressDelay + holdSteps) {
+            releaseAll();
+            released = true;
         }
 
-        dummy->update(dt);
+        d1->update(dt);
+        if (d2) d2->update(dt);
 
-        if (g_simDead || dummy->m_isDead) {
+        if (anyDead()) {
             markDeath(i);
             break;
         }
 
-        resetCollisionLog(dummy);
-        pl->checkCollisions(dummy, dt, false);
+        resetCollisionLog(d1);
+        pl->checkCollisions(d1, dt, false);
+        if (d2) {
+            resetCollisionLog(d2);
+            pl->checkCollisions(d2, dt, false);
+        }
 
-        if (g_simDead || dummy->m_isDead) {
+        if (anyDead()) {
             markDeath(i);
             break;
         }
 
-        cocos2d::CCPoint current = dummy->getPosition();
+        cocos2d::CCPoint current = d1->getPosition();
         if (draw && i < drawSteps) {
             draw->drawSegment(previous, current, 0.8f, color);
         }
@@ -188,137 +282,281 @@ SimResult runSimulation(
         ++result.survived;
 
         // Tap: the jump has happened once the player left the ground, so let go.
-        if (plan == SimPlan::Tap && pressed && !tapDone) {
-            if (dummy->m_isOnGround) {
+        if (plan == SimPlan::Tap && pressed && !released) {
+            if (d1->m_isOnGround) {
                 tapArmed = true;
             } else if (tapArmed) {
-                dummy->releaseButton(PlayerButton::Jump);
-                tapDone = true;
+                releaseAll();
+                released = true;
             }
         }
 
-        // A real jump that landed and stayed on the ground for a moment counts
-        // as safe (the next obstacle is handled by the next decision).
-        if (!flying) {
-            if (dummy->m_isOnGround) {
-                airborneStreak = 0;
-                if (jumped && ++landedStreak >= kLandSettleSteps) {
-                    result.survived = maxSteps;
-                    break;
-                }
-            } else {
-                landedStreak = 0;
-                if (++airborneStreak >= kJumpAirborneSteps) {
-                    jumped = true;
-                }
-            }
+        // The path reached a portal: what comes after it is not modelled, so
+        // the prediction ends here (counts as safe; the next frame re-syncs
+        // with the real player once it has actually gone through).
+        if (g_simPortal) {
+            result.survived = maxSteps;
+            break;
+        }
+
+        // Only used to tell "jump too early" from "jump too late" on death.
+        if (d1->m_isOnGround) {
+            airborneStreak = 0;
+        } else if (++airborneStreak >= 15) {
+            jumped = true;
         }
     }
 
-    dummy->releaseButton(PlayerButton::Jump);
-    dummy->setVisible(false);
+    releaseAll();
+    d1->setVisible(false);
+    if (d2) d2->setVisible(false);
 
     g_simulating = false;
-    g_simDummy = nullptr;
+    g_simDummies[0] = nullptr;
+    g_simDummies[1] = nullptr;
     return result;
 }
 
-enum class JumpOutlook {
-    Survives, // a jump starting after the delay gets through
-    TooEarly, // it fails, but only because the jump would start too early
-    TooLate   // it fails because the jump window is already over
-};
-
-// How does a jump that starts after `delay` substeps fare? Tries a single jump
-// first, then holding (bunny hop). With earlyExit, a "too early" single jump
-// is returned right away (cheaper; enough when you only need to know whether
-// waiting is still fine). When it returns Survives, `survivedPlan` (if given)
-// tells which plan made it so the bot can execute the same plan for real.
-JumpOutlook jumpOutlook(
-    PlayLayer* pl, PlayerObject* dummy, PlayerObject* source,
-    int delay, int steps, float dt, bool earlyExit, int& bestSurvived,
-    SimPlan* survivedPlan = nullptr
+static SimResult probe(
+    SimRig const& rig, SimPlan plan, int delay, int holdSteps, int steps
 ) {
-    bool allLate = true;
-    for (SimPlan plan : {SimPlan::Tap, SimPlan::Hold}) {
-        SimResult r = runSimulation(
-            pl, dummy, source, plan, delay, steps, 0, dt, nullptr, kNoColor
-        );
-        bestSurvived = std::max(bestSurvived, r.survived);
-        if (!r.died) {
-            if (survivedPlan) *survivedPlan = plan;
-            return JumpOutlook::Survives;
+    return runSimulation(rig, plan, delay, holdSteps, steps, 0, nullptr, kNoColor);
+}
+
+// Cube / ball / robot / spider: jump at the last moment a jump still works.
+//
+// A jump is judged by simulating it for the whole lookahead (so a jump is
+// chosen that also sets up the NEXT obstacle, e.g. landing on the start of a
+// narrow pillar). Single taps are preferred; holding (bunny hop) is only used
+// when no single tap gets through, e.g. on pillar staircases.
+//  - a jump one frame later still works       -> keep waiting
+//  - a jump now works but one frame later not -> the window is closing, jump
+//  - a tap window lies ahead                  -> keep waiting for it
+// If nothing gets through the full lookahead, judge again with a shorter
+// window that only covers the first hazard.
+static BotAction decideGround(
+    SimRig const& rig, SimResult const& idle, int botSteps
+) {
+    const int frameSteps = std::clamp(g_frameSubsteps, 1, 16);
+    const int waitDelay = frameSteps + kWaitMarginSteps;
+
+    const int horizons[2] = {
+        botSteps, std::min(botSteps, idle.survived + kShortExtra)
+    };
+    int bestNow = 0;
+    int bestWait = 0;
+
+    for (int hi = 0; hi < 2; ++hi) {
+        const int steps = horizons[hi];
+        if (hi == 1 && steps >= botSteps) break;
+
+        // 1. Single tap.
+        SimResult tapWait = probe(rig, SimPlan::Tap, waitDelay, -1, steps);
+        bestWait = std::max(bestWait, tapWait.survived);
+        if (!tapWait.died) return BotAction::Release;
+
+        SimResult tapNow = probe(rig, SimPlan::Tap, 0, -1, steps);
+        bestNow = std::max(bestNow, tapNow.survived);
+        if (!tapNow.died) return BotAction::Tap;
+
+        // Is there a tap window further ahead? (probe the middle of where a
+        // jump over the first hazard would have to start)
+        const int ahead = idle.survived - kTapProbeBack;
+        if (ahead > waitDelay) {
+            SimResult tapAhead = probe(rig, SimPlan::Tap, ahead, -1, steps);
+            if (!tapAhead.died) return BotAction::Release;
         }
-        if (!r.late) {
-            allLate = false;
-            if (earlyExit) return JumpOutlook::TooEarly;
+
+        // 2. Hold (bunny hop).
+        bool earlyAtWait = !tapWait.late;
+        SimResult holdWait = probe(rig, SimPlan::Hold, waitDelay, -1, steps);
+        bestWait = std::max(bestWait, holdWait.survived);
+        if (!holdWait.died) return BotAction::Release;
+        if (!holdWait.late) earlyAtWait = true;
+
+        SimResult holdNow = probe(rig, SimPlan::Hold, 0, -1, steps);
+        bestNow = std::max(bestNow, holdNow.survived);
+        if (!holdNow.died) return BotAction::Hold;
+
+        // Nothing works now or one frame later, but the failures look like
+        // "too early": the window is still ahead.
+        if (earlyAtWait && idle.survived > waitDelay + kImminentSteps) {
+            return BotAction::Release;
         }
     }
-    return allLate ? JumpOutlook::TooLate : JumpOutlook::TooEarly;
+
+    // Nothing survives: only press if it is clearly the longest-lasting option.
+    if (bestNow > std::max(idle.survived, bestWait) + kDoomedMargin) {
+        return BotAction::Hold;
+    }
+    return BotAction::Release;
+}
+
+// Ship / UFO / swing: try short pulses as well as hold-forever / release-forever.
+// Each candidate is "input A for a while, then the opposite input forever".
+// Keep the current input if any candidate that starts with it gets through.
+static BotAction decideFlying(
+    SimRig const& rig, SimResult const& idle, int botSteps, bool currentlyHolding
+) {
+    static constexpr int kPulse[3] = {8, 24, 64};
+
+    // Best survival among candidates starting with each input (for doomed cases).
+    int bestHold = 0;
+    int bestRelease = idle.survived;
+
+    auto startsHolding = [&]() {
+        SimResult r = probe(rig, SimPlan::Hold, 0, -1, botSteps);
+        bestHold = std::max(bestHold, r.survived);
+        if (!r.died) return true;
+        for (int h : kPulse) {
+            r = probe(rig, SimPlan::Hold, 0, h, botSteps);
+            bestHold = std::max(bestHold, r.survived);
+            if (!r.died) return true;
+        }
+        return false;
+    };
+    auto startsReleasing = [&]() {
+        for (int d : kPulse) {
+            SimResult r = probe(rig, SimPlan::Hold, d, -1, botSteps);
+            bestRelease = std::max(bestRelease, r.survived);
+            if (!r.died) return true;
+        }
+        return false;
+    };
+
+    if (currentlyHolding) {
+        if (startsHolding()) return BotAction::Hold;
+        if (startsReleasing()) return BotAction::Release;
+    } else {
+        if (startsReleasing()) return BotAction::Release;
+        if (startsHolding()) return BotAction::Hold;
+    }
+
+    // Nothing gets through: switch only if clearly better, otherwise keep input.
+    if (bestHold > bestRelease + kFlySwitchMargin) return BotAction::Hold;
+    if (bestRelease > bestHold + kFlySwitchMargin) return BotAction::Release;
+    return currentlyHolding ? BotAction::Hold : BotAction::Release;
+}
+
+// Wave (default): hold-vs-release comparison with hysteresis. Cheap and works
+// well in practice.
+static BotAction decideWaveClassic(
+    SimRig const& rig, SimResult const& idle, int botSteps, bool currentlyHolding
+) {
+    if (!(idle.died && idle.survived < botSteps)) return BotAction::Release;
+    SimResult hold = probe(rig, SimPlan::Hold, 0, -1, botSteps);
+    if (!hold.died && idle.died) return BotAction::Hold;
+    if (hold.died && !idle.died) return BotAction::Release;
+    if (!hold.died && !idle.died) {
+        return currentlyHolding ? BotAction::Hold : BotAction::Release;
+    }
+    if (hold.survived > idle.survived + kFlySwitchMargin) return BotAction::Hold;
+    if (idle.survived > hold.survived + kFlySwitchMargin) return BotAction::Release;
+    return currentlyHolding ? BotAction::Hold : BotAction::Release;
+}
+
+// Wave (experimental setting): choose the roomiest path, not just any path that survives.
+//
+// Candidates are "hold, then release" / "release, then hold" with one switch
+// (or none). Every candidate that survives the lookahead is then re-tested
+// with the player shifted up and down by growing amounts; candidates that
+// only fit when the wave is exactly on the line are dropped first. Whatever
+// is left wins, and the current input is kept when it is still among them.
+static BotAction decideWave(
+    SimRig const& rig, SimResult const& idle, int lookahead, bool currentlyHolding
+) {
+    const int botSteps = std::min(lookahead, kWaveMaxSteps);
+    const bool idleDied = idle.died && idle.survived < botSteps;
+
+    // No hazard on either straight path: keep flying the way we are.
+    SimResult hold = probe(rig, SimPlan::Hold, 0, -1, botSteps);
+    if (!hold.died && !idleDied) {
+        return currentlyHolding ? BotAction::Hold : BotAction::Release;
+    }
+
+    struct Cand { bool startHold; int sw; bool alive; int survived; };
+    Cand cands[6] = {
+        {true, -1, false, 0}, {true, kWavePulseA, false, 0}, {true, kWavePulseB, false, 0},
+        {false, -1, false, 0}, {false, kWavePulseA, false, 0}, {false, kWavePulseB, false, 0},
+    };
+
+    auto run = [&](SimRig const& r, Cand const& c) {
+        if (c.startHold) return probe(r, SimPlan::Hold, 0, c.sw, botSteps);
+        if (c.sw < 0) return probe(r, SimPlan::Release, 0, -1, botSteps);
+        return probe(r, SimPlan::Hold, c.sw, -1, botSteps);
+    };
+
+    bool any = false;
+    int bestHold = 0;
+    int bestRelease = 0;
+    for (Cand& c : cands) {
+        SimResult r = run(rig, c);
+        c.alive = !r.died;
+        c.survived = r.survived;
+        any = any || c.alive;
+        if (c.startHold) bestHold = std::max(bestHold, r.survived);
+        else bestRelease = std::max(bestRelease, r.survived);
+    }
+
+    if (!any) {
+        // Squeezed: switch only if one side clearly lasts longer.
+        if (bestHold > bestRelease + kFlySwitchMargin) return BotAction::Hold;
+        if (bestRelease > bestHold + kFlySwitchMargin) return BotAction::Release;
+        return currentlyHolding ? BotAction::Hold : BotAction::Release;
+    }
+
+    static constexpr float kRoom[3] = {5.f, 10.f, 16.f};
+    for (float room : kRoom) {
+        bool pass[6] = {false, false, false, false, false, false};
+        bool anyPass = false;
+        SimRig up = rig;
+        SimRig down = rig;
+        up.yOffset = room;
+        down.yOffset = -room;
+        for (int i = 0; i < 6; ++i) {
+            if (!cands[i].alive) continue;
+            pass[i] = !run(up, cands[i]).died && !run(down, cands[i]).died;
+            anyPass = anyPass || pass[i];
+        }
+        if (!anyPass) break; // nobody has this much room: keep the previous set
+        for (int i = 0; i < 6; ++i) {
+            if (!pass[i]) cands[i].alive = false;
+        }
+    }
+
+    bool holdStart = false;
+    bool releaseStart = false;
+    for (Cand const& c : cands) {
+        if (!c.alive) continue;
+        if (c.startHold) holdStart = true;
+        else releaseStart = true;
+    }
+    if (currentlyHolding) return holdStart ? BotAction::Hold : BotAction::Release;
+    return releaseStart ? BotAction::Release : BotAction::Hold;
 }
 
 // Decides what the bot should do this frame.
 // `idle` is the "release now" simulation (it may be longer than botSteps).
-// `currentlyHolding` is the real current input, used for flying hysteresis.
 BotAction decideAutoPress(
-    PlayLayer* pl, PlayerObject* dummy, PlayerObject* source,
-    SimResult const& idle, int botSteps, float dt, bool currentlyHolding
+    SimRig const& rig, SimResult const& idle, int botSteps, bool currentlyHolding
 ) {
+    PlayerObject* p = rig.source;
+
+    if (p->m_isDart) {
+        return rig.roomAwareWave
+            ? decideWave(rig, idle, botSteps, currentlyHolding)
+            : decideWaveClassic(rig, idle, botSteps, currentlyHolding);
+    }
+
     // Nothing dangerous inside the lookahead window: stay released.
     if (!(idle.died && idle.survived < botSteps)) {
         return BotAction::Release;
     }
 
-    // Flying modes (ship / swing / wave): bang-bang control with hysteresis so
-    // the input does not flap every frame. Hold to climb, release to dive;
-    // only switch when the other option is better or the current one dies.
-    if (isFlyingMode(source)) {
-        SimResult hold = runSimulation(
-            pl, dummy, source, SimPlan::Hold, 0, botSteps, 0, dt, nullptr, kNoColor
-        );
-        if (!hold.died && idle.died) return BotAction::Hold;
-        if (hold.died && !idle.died) return BotAction::Release;
-        if (!hold.died && !idle.died) {
-            // Both fine inside the window: keep the current input.
-            return currentlyHolding ? BotAction::Hold : BotAction::Release;
-        }
-        // Both fail: switch only if it is clearly the longer-surviving path.
-        if (hold.survived > idle.survived + kFlySwitchMargin) return BotAction::Hold;
-        if (idle.survived > hold.survived + kFlySwitchMargin) return BotAction::Release;
-        return currentlyHolding ? BotAction::Hold : BotAction::Release;
-    }
-
-    // Cube / ball / etc: jump at the LAST safe moment instead of the moment the
-    // danger first shows up. Look at a jump that would start one frame from now:
-    //  - it works, or it only fails for being too early -> keep waiting
-    //  - it fails for being too late -> the window is closing, jump now
-    const int frameSteps = std::clamp(g_frameSubsteps, 1, 16);
-    const int waitDelay = frameSteps + kWaitMarginSteps;
-
-    int waitBest = 0;
-    JumpOutlook waitOutlook = jumpOutlook(
-        pl, dummy, source, waitDelay, botSteps, dt, true, waitBest
-    );
-    if (waitOutlook == JumpOutlook::Survives) return BotAction::Release;
-    if (waitOutlook == JumpOutlook::TooEarly &&
-        idle.survived > waitDelay + kImminentSteps) {
-        return BotAction::Release;
-    }
-
-    // Waiting is over: jump now with the SAME plan the simulation validated.
-    SimPlan winning = SimPlan::Hold;
-    int pressBest = 0;
-    if (jumpOutlook(pl, dummy, source, 0, botSteps, dt, false, pressBest, &winning) ==
-        JumpOutlook::Survives) {
-        return winning == SimPlan::Hold ? BotAction::Hold : BotAction::Tap;
-    }
-
-    // Nothing survives: only press if it is clearly the longest-lasting option.
-    if (pressBest > std::max(idle.survived, waitBest) + kDoomedMargin) {
-        return BotAction::Hold;
-    }
-    return BotAction::Release;
+    if (isFlyingMode(p)) return decideFlying(rig, idle, botSteps, currentlyHolding);
+    return decideGround(rig, idle, botSteps);
 }
+// ---- END PORTABLE LOGIC ----
 
 class $modify(AutoTrajPlayerObject, PlayerObject) {
     void update(float dt) {
@@ -385,12 +623,19 @@ class $modify(AutoTrajBaseLayer, GJBaseGameLayer) {
     }
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int count, float dt) {
-        if (g_simulating && player == g_simDummy && objects) {
+        if (g_simulating && isSimDummy(player) && objects) {
             gd::vector<GameObject*> filtered;
             filtered.reserve(count);
             for (int i = 0; i < count; ++i) {
                 auto* object = objects->at(i);
                 if (!object) continue;
+
+                // Portals change gravity / mode / speed / size, which the
+                // simulation does not model. Remember that the path reached
+                // one so the prediction stops there instead of guessing.
+                if (isPortalId(object->m_objectID) && nearPortal(player, object)) {
+                    g_simPortal = true;
+                }
 
                 switch (object->m_objectType) {
                     case GameObjectType::Solid:
@@ -427,11 +672,9 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         bool botTapActive = false;
         bool botTapGrounded = false;
         int botTapBudget = 0;
-        bool bot2Holding = false;
-        bool bot2TapActive = false;
-        bool bot2TapGrounded = false;
-        int bot2TapBudget = 0;
         bool loggedSetup = false;
+        int logFrame = 0;
+        int lastLoggedAction = -1;
         bool lastAuto = false;
         bool lastTraj = true;
         bool lastUi = true;
@@ -459,9 +702,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             m_fields->dummy1 = nullptr;
         }
 
-        // Second dummy for dual mode (player 2). Only used when the level is
-        // actually dual; kept invisible otherwise.
-        m_fields->dummy2 = PlayerObject::create(1, 1, this, this, true);
+        // Second hidden player for dual mode.
+        m_fields->dummy2 = PlayerObject::create(1, 1, this, this, false);
         if (m_fields->dummy2 && m_objectLayer) {
             m_fields->dummy2->setVisible(false);
             m_fields->dummy2->setID("autotraj-dummy-2"_spr);
@@ -476,10 +718,6 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->botTapActive = false;
         m_fields->botTapGrounded = false;
         m_fields->botTapBudget = 0;
-        m_fields->bot2Holding = false;
-        m_fields->bot2TapActive = false;
-        m_fields->bot2TapGrounded = false;
-        m_fields->bot2TapBudget = 0;
         m_fields->loggedSetup = false;
         g_warnedStepZero = false;
 
@@ -547,28 +785,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->botTapBudget = 0;
     }
 
-    void releaseBot2() {
-        if (m_fields->bot2Holding && m_player2) {
-            this->handleButton(false, 2, true);
-        }
-        m_fields->bot2Holding = false;
-    }
-
-    void pressBot2() {
-        if (!m_fields->bot2Holding && m_player2) {
-            this->handleButton(true, 2, true);
-            m_fields->bot2Holding = true;
-        }
-    }
-
-    void cancelTap2() {
-        m_fields->bot2TapActive = false;
-        m_fields->bot2TapGrounded = false;
-        m_fields->bot2TapBudget = 0;
-    }
-
     void destroyPlayer(PlayerObject* player, GameObject* object) override {
-        if (g_simulating && g_simDummy && player == g_simDummy) {
+        if (g_simulating && isSimDummy(player)) {
             g_simDead = true;
             return;
         }
@@ -578,18 +796,12 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             m_fields->botHolding = false;
             this->cancelTap();
         }
-        if (player == m_player2) {
-            m_fields->bot2Holding = false;
-            this->cancelTap2();
-        }
     }
 
     void resetLevel() override {
         PlayLayer::resetLevel();
         m_fields->botHolding = false;
         this->cancelTap();
-        m_fields->bot2Holding = false;
-        this->cancelTap2();
     }
 
     void playEndAnimationToPos(cocos2d::CCPoint pos) {
@@ -602,73 +814,6 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         PlayLayer::flipGravity(player, flip, noEffects);
     }
 
-    // Runs the per-player decision + input mirroring for one player/dummy pair.
-    // Returns the action chosen (for debugging / future use).
-    BotAction runBotForPlayer(
-        PlayerObject* player,
-        PlayerObject* dummy,
-        SimResult const& idleResult,
-        int botSteps,
-        float dtStep,
-        bool& holding,
-        bool& tapActive,
-        bool& tapGrounded,
-        int& tapBudget,
-        void (AutoTrajPlayLayer::*press)(),
-        void (AutoTrajPlayLayer::*release)(),
-        void (AutoTrajPlayLayer::*cancel)()
-    ) {
-        // Finish an in-flight tap before anything else: the simulation that
-        // validated it assumed the button stays down until the player has left
-        // the ground after touching it. Releasing earlier would desync the
-        // real input from the validated plan (this is what made the bot jump
-        // only once at multi-pillar hold sections).
-        //
-        // A tap only counts as launched once the player has been on the ground
-        // AFTER the press and then left the ground again. If the player was
-        // airborne at press time (e.g. late frame), we keep holding until the
-        // next real takeoff, exactly like the simulation does.
-        bool tapForcedHold = false;
-        if (tapActive) {
-            if (player->m_isOnGround) {
-                tapGrounded = true;
-            }
-            tapBudget -= std::max(1, g_frameSubsteps);
-            bool launched = tapGrounded && !player->m_isOnGround;
-            if (launched || tapBudget <= 0) {
-                (this->*cancel)();
-            } else {
-                tapForcedHold = true;
-            }
-        }
-
-        BotAction action = tapForcedHold
-            ? BotAction::Hold
-            : decideAutoPress(this, dummy, player, idleResult, botSteps, dtStep, holding);
-
-        switch (action) {
-            case BotAction::Hold:
-                (this->*cancel)();
-                (this->*press)();
-                break;
-            case BotAction::Tap:
-                // Mirrors SimPlan::Tap: press now, keep holding until the
-                // player has been grounded and left the ground again.
-                (this->*press)();
-                if (!tapActive) {
-                    tapActive = true;
-                    tapGrounded = false; // require a grounded phase after press
-                    tapBudget = kTapBudgetSteps;
-                }
-                break;
-            case BotAction::Release:
-            default:
-                (this->*cancel)();
-                (this->*release)();
-                break;
-        }
-        return action;
-    }
     void postUpdate(float dt) override {
         PlayLayer::postUpdate(dt);
 
@@ -721,16 +866,13 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         if (!m_player1 || m_player1->m_isDead || !m_fields->dummy1) {
             this->releaseBot();
             this->cancelTap();
-            this->releaseBot2();
-            this->cancelTap2();
             return;
         }
 
+        // Platformer levels are not supported (no fixed forward motion).
         if (m_player1->m_isPlatformer) {
             this->releaseBot();
             this->cancelTap();
-            this->releaseBot2();
-            this->cancelTap2();
             return;
         }
 
@@ -742,15 +884,24 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         // The overlay length is purely visual. The bot has its own lookahead,
         // so changing one never changes how the other behaves.
         int drawSteps = trajOn ? std::clamp(trajectorySteps(), 10, 400) : 0;
-        int botSteps = autoOn ? std::clamp(autoPlayLookahead(), 24, 240) : 0;
+        int botSteps = autoOn ? std::clamp(autoPlayLookahead(), 24, 480) : 0;
         int horizon = std::max(drawSteps, botSteps);
 
         if (horizon <= 0) {
             this->releaseBot();
             this->cancelTap();
-            this->releaseBot2();
-            this->cancelTap2();
             return;
+        }
+
+        SimRig rig;
+        rig.pl = this;
+        rig.dummy = m_fields->dummy1;
+        rig.source = m_player1;
+        rig.dt = dtStep;
+        rig.roomAwareWave = waveRoomAwareEnabled();
+        if (m_gameState.m_isDualMode && m_player2 && m_fields->dummy2 && !m_player2->m_isDead) {
+            rig.dummy2 = m_fields->dummy2;
+            rig.source2 = m_player2;
         }
 
         auto* drawNode = drawSteps > 0 ? m_fields->drawNode : nullptr;
@@ -759,14 +910,14 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         SimResult holdResult{};
         if (drawSteps > 0) {
             holdResult = runSimulation(
-                this, m_fields->dummy1, m_player1, SimPlan::Hold, 0, drawSteps, drawSteps, dtStep,
+                rig, SimPlan::Hold, 0, -1, drawSteps, drawSteps,
                 drawNode, cocos2d::ccColor4F{0.15f, 1.f, 0.35f, 1.f}
             );
         }
 
         // Red: release now. Shared with the bot's "is it dangerous?" check.
         SimResult idleResult = runSimulation(
-            this, m_fields->dummy1, m_player1, SimPlan::Release, 0, horizon, drawSteps, dtStep,
+            rig, SimPlan::Release, 0, -1, horizon, drawSteps,
             drawNode, cocos2d::ccColor4F{1.f, 0.3f, 0.3f, 1.f}
         );
 
@@ -779,60 +930,79 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             );
         }
 
-        // ---- Player 1 bot ----
+        // Finish an in-flight tap before anything else: the simulation that
+        // validated it assumed the button stays down until the player has left
+        // the ground after touching it. Releasing earlier would desync the
+        // real input from the validated plan.
+        bool tapForcedHold = false;
+        if (m_fields->botTapActive) {
+            if (m_player1->m_isOnGround) {
+                m_fields->botTapGrounded = true;
+            }
+            m_fields->botTapBudget -= std::max(1, g_frameSubsteps);
+            bool launched = m_fields->botTapGrounded && !m_player1->m_isOnGround;
+            if (launched || m_fields->botTapBudget <= 0) {
+                this->cancelTap();
+            } else {
+                tapForcedHold = true;
+            }
+        }
+
         if (autoOn) {
-            this->runBotForPlayer(
-                m_player1, m_fields->dummy1, idleResult, botSteps, dtStep,
-                m_fields->botHolding, m_fields->botTapActive,
-                m_fields->botTapGrounded, m_fields->botTapBudget,
-                &AutoTrajPlayLayer::pressBot,
-                &AutoTrajPlayLayer::releaseBot,
-                &AutoTrajPlayLayer::cancelTap
-            );
+            BotAction action = tapForcedHold
+                ? BotAction::Hold
+                : decideAutoPress(rig, idleResult, botSteps, m_fields->botHolding);
+
+            if (debugLogEnabled()) {
+                ++m_fields->logFrame;
+                const bool hazard = idleResult.died && idleResult.survived < botSteps;
+                if (static_cast<int>(action) != m_fields->lastLoggedAction ||
+                    (hazard && m_fields->logFrame % 15 == 0)) {
+                    m_fields->lastLoggedAction = static_cast<int>(action);
+                    log::info(
+                        "[AT] f={} x={:.0f} y={:.0f} gnd={} up={} mode={}{}{}{}{} dual={} "
+                        "idle(died={} surv={}) tap={} action={}",
+                        m_fields->logFrame, m_player1->getPositionX(), m_player1->getPositionY(),
+                        m_player1->m_isOnGround, m_player1->m_isUpsideDown,
+                        m_player1->m_isShip ? "ship" : "", m_player1->m_isBird ? "ufo" : "",
+                        m_player1->m_isDart ? "wave" : "", m_player1->m_isSwing ? "swing" : "",
+                        (!isFlyingMode(m_player1)) ? "ground" : "",
+                        rig.dummy2 != nullptr, idleResult.died, idleResult.survived,
+                        m_fields->botTapActive, static_cast<int>(action)
+                    );
+                }
+            }
+
+            switch (action) {
+                case BotAction::Hold:
+                    this->cancelTap();
+                    this->pressBot();
+                    break;
+                case BotAction::Tap:
+                    // Mirrors SimPlan::Tap: press now, keep holding until the
+                    // player has been grounded and left the ground again.
+                    this->pressBot();
+                    if (!m_fields->botTapActive) {
+                        m_fields->botTapActive = true;
+                        m_fields->botTapGrounded = m_player1->m_isOnGround;
+                        m_fields->botTapBudget = kTapBudgetSteps;
+                    }
+                    break;
+                case BotAction::Release:
+                default:
+                    this->cancelTap();
+                    this->releaseBot();
+                    break;
+            }
         } else {
             this->releaseBot();
             this->cancelTap();
-        }
-
-        // ---- Player 2 bot (dual mode) ----
-        bool dualActive = m_gameState.m_isDualMode && m_player2 && !m_player2->m_isDead && m_fields->dummy2;
-        if (dualActive) {
-            // Blue: player 2 press & hold (overlay only).
-            if (drawSteps > 0) {
-                runSimulation(
-                    this, m_fields->dummy2, m_player2, SimPlan::Hold, 0, drawSteps, drawSteps, dtStep,
-                    drawNode, cocos2d::ccColor4F{0.3f, 0.6f, 1.f, 1.f}
-                );
-            }
-            // Yellow: player 2 release.
-            SimResult idle2 = runSimulation(
-                this, m_fields->dummy2, m_player2, SimPlan::Release, 0, horizon, drawSteps, dtStep,
-                drawNode, cocos2d::ccColor4F{1.f, 0.9f, 0.2f, 1.f}
-            );
-            if (autoOn) {
-                this->runBotForPlayer(
-                    m_player2, m_fields->dummy2, idle2, botSteps, dtStep,
-                    m_fields->bot2Holding, m_fields->bot2TapActive,
-                    m_fields->bot2TapGrounded, m_fields->bot2TapBudget,
-                    &AutoTrajPlayLayer::pressBot2,
-                    &AutoTrajPlayLayer::releaseBot2,
-                    &AutoTrajPlayLayer::cancelTap2
-                );
-            } else {
-                this->releaseBot2();
-                this->cancelTap2();
-            }
-        } else {
-            this->releaseBot2();
-            this->cancelTap2();
         }
     }
 
     void onQuit() {
         this->releaseBot();
         this->cancelTap();
-        this->releaseBot2();
-        this->cancelTap2();
 
         m_fields->drawNode = nullptr;
         m_fields->dummy1 = nullptr;
