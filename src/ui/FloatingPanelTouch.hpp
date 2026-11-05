@@ -43,8 +43,8 @@ namespace at::ui {
                 return false;
             }
             auto local = m_panel->convertToNodeSpace(touch->getLocation());
-            const float headerBottom = *m_collapsed ? 0.f : 92.f;
-            const float headerTop = *m_collapsed ? 34.f : 118.f;
+            const float headerBottom = *m_collapsed ? 0.f : 130.f;
+            const float headerTop = *m_collapsed ? 34.f : 156.f;
             if (local.x < 0.f || local.x > 190.f || local.y < headerBottom || local.y > headerTop) {
                 return false;
             }
@@ -63,7 +63,7 @@ namespace at::ui {
             if (!m_moved) return;
 
             auto size = cocos2d::CCDirector::sharedDirector()->getWinSize();
-            const float height = (*m_collapsed) ? 34.f : 118.f;
+            const float height = (*m_collapsed) ? 34.f : 156.f;
             const float x = std::clamp(m_panelStart.x + delta.x, 0.f,
                                        std::max(0.f, size.width - 190.f));
             const float y = std::clamp(m_panelStart.y + delta.y, 0.f,
