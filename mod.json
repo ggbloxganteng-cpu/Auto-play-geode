@@ -8,7 +8,7 @@
 	},
 	"id": "yourname.auto-trajectory",
 	"name": "Auto Trajectory",
-	"version": "v0.2.0",
+	"version": "v0.5.0",
 	"developer": "yourname",
 	"description": "Auto play bot with a live jump trajectory overlay.",
 	"links": {
@@ -22,7 +22,7 @@
 		"auto-play": {
 			"type": "bool",
 			"name": "Auto Play",
-			"description": "Automatically jumps when releasing would crash the player within the preview window. Cube/ball modes only (no dual, platformer, or flying modes).",
+			"description": "Plays for you: jumps at the last safe moment (cube/ball), steers ship/UFO/swing/wave, and handles dual mode. Not available in platformer levels.",
 			"default": false
 		},
 		"show-trajectory": {
@@ -51,15 +51,21 @@
 		"autoplay-lookahead": {
 			"type": "int",
 			"name": "Auto Play Lookahead",
-			"description": "How many physics substeps (240 per second) the bot looks ahead before deciding to jump.",
-			"default": 132,
+			"description": "How far ahead (physics substeps, 240 per second) the bot plans. Longer values let it set up chains of jumps (e.g. pillar staircases). It still jumps at the last safe moment.",
+			"default": 200,
 			"min": 24,
-			"max": 240,
+			"max": 480,
 			"control": {
 				"slider": true,
 				"arrows": true,
 				"arrow-step": 12
 			}
+		},
+		"wave-room-aware": {
+			"type": "bool",
+			"name": "Wave: Roomy Path (experimental)",
+			"description": "Wave tries several hold/release patterns and prefers the one with the most room around it. Uses several times more CPU than the default wave bot, so it may lower FPS on weaker phones.",
+			"default": false
 		},
 		"ui-title": {
 			"type": "title",
@@ -70,6 +76,16 @@
 			"name": "Show In-Game Buttons",
 			"description": "Shows the Auto Play / Trajectory toggle buttons while playing.",
 			"default": true
+		},
+		"debug-title": {
+			"type": "title",
+			"name": "Debug"
+		},
+		"debug-log": {
+			"type": "bool",
+			"name": "Debug Log",
+			"description": "Writes the bot's decisions to the Geode log whenever its action changes (and every few frames near a hazard). Turn on and send the log if the bot misbehaves.",
+			"default": false
 		}
 	}
 }

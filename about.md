@@ -1,9 +1,10 @@
 # Auto Trajectory
 
-A small gameplay test mod that adds:
+A Geometry Dash Geode mod that adds:
 
-- a predictive **auto play** bot
-- a live **trajectory** overlay (hold vs release)
-- in-game toggle buttons
+- predictive **auto play** and a live **trajectory** overlay
+- hidden-clone simulation for common orbs and pads, with object-state restoration
+- portal-aware prediction that re-syncs at complex mode/size transitions
+- an optional experimental multi-step wave planner
 
 Built for Geometry Dash 2.2081 / Geode v5.11.2.
