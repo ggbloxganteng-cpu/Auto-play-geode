@@ -8,6 +8,7 @@
 #include <utility>
 #include <unordered_set>
 #include <vector>
+#include "planning/WavePlanner2.hpp"
 
 // ---- BEGIN PORTABLE LOGIC (also compiled by the offline test harness) ----
 namespace {
@@ -731,46 +732,34 @@ static BotAction decideWave(
         lookahead, rig.deepWaveSearch ? kWaveDeepMaxSteps : kWaveLightMaxSteps
     );
     const int frameSteps = std::clamp(g_frameSubsteps, 1, 8);
-
+    const int candidateBudget = rig.deepWaveSearch ? 12 : 6;
+    auto generated = at::planning::generateWaveCandidates(
+        currentlyHolding, frameSteps, botSteps, candidateBudget,
+        rig.deepWaveSearch ? 2 : 1
+    );
     struct Candidate {
         WavePlan plan;
         bool alive = false;
         int survived = 0;
         int switches = 0;
     };
-    Candidate candidates[6];
-    int count = 0;
-    auto add = [&](bool startHold, std::initializer_list<int> changes) {
-        if (count >= static_cast<int>(std::size(candidates))) return;
-        Candidate& candidate = candidates[count++];
-        candidate.plan.startHolding = startHold;
-        candidate.plan.switchCount = 0;
-        int previous = 0;
-        for (int at : changes) {
-            if (at <= previous || at >= botSteps || candidate.plan.switchCount >= 8) continue;
-            candidate.plan.switchSteps[candidate.plan.switchCount++] = at;
-            previous = at;
-        }
-        candidate.switches = candidate.plan.switchCount;
-    };
-
-    const bool opposite = !currentlyHolding;
-    // Bounded beam: two straight paths first. The light profile adds two
-    // one-switch corrections over 108 steps; the optional deep profile adds
-    // four timing probes over 144 steps. Corrections run only when both straight
-    // paths fail. Light is cheaper but less reliable in some corridor layouts.
-    add(currentlyHolding, {});
-    add(opposite, {});
-    add(currentlyHolding, {1 * frameSteps});
-    add(opposite, {1 * frameSteps});
-
+    std::vector<Candidate> candidates;
+    candidates.reserve(generated.size());
+    for (auto const& source : generated) {
+        Candidate candidate;
+        candidate.plan.startHolding = source.startHolding;
+        candidate.plan.switchCount = source.switchCount;
+        candidate.plan.switchSteps = source.switchSteps;
+        candidate.switches = source.switchCount;
+        candidates.push_back(candidate);
+    }
     bool anyAlive = false;
     int bestIndex = -1;
     int bestHoldSurvival = 0;
     int bestReleaseSurvival = 0;
     auto evaluate = [&](int i) {
-        SimResult result = probeWave(rig, candidates[i].plan, botSteps);
-        Candidate& candidate = candidates[i];
+        SimResult result = probeWave(rig, candidates[static_cast<std::size_t>(i)].plan, botSteps);
+        Candidate& candidate = candidates[static_cast<std::size_t>(i)];
         candidate.alive = !result.died;
         candidate.survived = result.survived;
         anyAlive = anyAlive || candidate.alive;
@@ -778,7 +767,7 @@ static BotAction decideWave(
         else bestReleaseSurvival = std::max(bestReleaseSurvival, result.survived);
         if (!candidate.alive) return;
         if (bestIndex < 0) { bestIndex = i; return; }
-        Candidate const& best = candidates[bestIndex];
+        Candidate const& best = candidates[static_cast<std::size_t>(bestIndex)];
         bool better = candidate.survived > best.survived;
         if (candidate.survived == best.survived) {
             if (candidate.switches < best.switches) better = true;
@@ -789,39 +778,24 @@ static BotAction decideWave(
         if (better) bestIndex = i;
     };
 
-    // Fast path: evaluate the two straight controls first. If either survives
-    // the whole horizon, corrections cannot improve survival and are skipped.
-    evaluate(0);
-    evaluate(1);
+    // Evaluate both straight paths first; a fully surviving path avoids the
+    // additional Wave 2.0 correction beam entirely.
+    if (candidates.size() >= 1) evaluate(0);
+    if (candidates.size() >= 2) evaluate(1);
     if (bestIndex >= 0) {
-        if (selectedPlan) *selectedPlan = candidates[bestIndex].plan;
-        return candidates[bestIndex].plan.startHolding ? BotAction::Hold : BotAction::Release;
+        if (selectedPlan) *selectedPlan = candidates[static_cast<std::size_t>(bestIndex)].plan;
+        return candidates[static_cast<std::size_t>(bestIndex)].plan.startHolding
+            ? BotAction::Hold : BotAction::Release;
     }
-
-    // Both straight paths failed. The light profile uses a single early
-    // correction in each starting direction. The deep profile spends four
-    // extra probes to compare early and later correction timings.
-    if (rig.deepWaveSearch) {
-        add(currentlyHolding, {2 * frameSteps});
-        add(currentlyHolding, {4 * frameSteps});
-        add(opposite, {2 * frameSteps});
-        add(opposite, {4 * frameSteps});
-    } else {
-        add(true, {frameSteps});
-        add(false, {frameSteps});
-    }
-
-    // Only spend the correction-search budget when both straight paths fail.
-    for (int i = 2; i < count; ++i) evaluate(i);
-
+    for (std::size_t i = 2; i < candidates.size(); ++i) evaluate(static_cast<int>(i));
     if (!anyAlive || bestIndex < 0) {
         if (bestHoldSurvival > bestReleaseSurvival + kFlySwitchMargin) return BotAction::Hold;
         if (bestReleaseSurvival > bestHoldSurvival + kFlySwitchMargin) return BotAction::Release;
         return currentlyHolding ? BotAction::Hold : BotAction::Release;
     }
-
-    if (selectedPlan) *selectedPlan = candidates[bestIndex].plan;
-    return candidates[bestIndex].plan.startHolding ? BotAction::Hold : BotAction::Release;
+    if (selectedPlan) *selectedPlan = candidates[static_cast<std::size_t>(bestIndex)].plan;
+    return candidates[static_cast<std::size_t>(bestIndex)].plan.startHolding
+        ? BotAction::Hold : BotAction::Release;
 }
 
 // Ball is an edge-triggered gravity switch, not a variable-height jump. Probe
