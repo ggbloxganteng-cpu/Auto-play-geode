@@ -621,7 +621,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->scheduler.setSettings(performanceSettings());
         m_fields->scheduler.beginFrame(dt > 0.f ? dt * 1000.f : 0.f);
         const auto perfMetrics = m_fields->scheduler.metrics();
-        if (perfMetrics.diagnostics && ++m_fields->performanceLogFrame % 120 == 0) {
+        if (Mod::get()->getSettingValue<bool>("performance-diagnostics") &&
+            ++m_fields->performanceLogFrame % 120 == 0) {
             log::info("[AT PERF] preset={} avgFrame={:.2f}ms budget={}us deferred={} adaptiveCuts={} emergencyYields={} jumpGrace={}",
                 performancePresetName(performancePreset()), perfMetrics.averageFrameMs,
                 perfMetrics.currentBudgetUs, perfMetrics.deferredSlices,
