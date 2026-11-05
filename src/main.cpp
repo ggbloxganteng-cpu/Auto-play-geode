@@ -252,6 +252,13 @@ class $modify(AutoTrajBaseLayer, GJBaseGameLayer) {
     }
 };
 
+// Panel label helper: text plus green/red tint for ON/OFF state.
+static void setStateLabel(cocos2d::CCLabelBMFont* label, const char* text, bool on) {
+    if (!label) return;
+    label->setString(text);
+    label->setColor(on ? cocos2d::ccColor3B{120, 255, 150} : cocos2d::ccColor3B{255, 130, 130});
+}
+
 class $modify(AutoTrajPlayLayer, PlayLayer) {
     struct Fields {
         cocos2d::CCDrawNode* drawNode = nullptr;
@@ -268,6 +275,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         cocos2d::CCLabelBMFont* performanceLabel = nullptr;
         cocos2d::CCLabelBMFont* adaptiveLabel = nullptr;
         cocos2d::CCLabelBMFont* metricsLabel = nullptr;
+        cocos2d::CCLabelBMFont* statusLabel = nullptr;
         AdaptiveScheduler scheduler{performanceSettings()};
         at::LevelScan levelScan;
         int lastCheckpoint = -1;
@@ -390,53 +398,111 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             m_fields->levelScan.maxX());
     }
 
+    // Rewrites every panel label from the current settings (single source of truth).
+    void refreshPanelLabels() {
+        const bool autoOn = autoPlayEnabled();
+        const bool trajOn = trajectoryEnabled();
+        const bool waveOn = waveRoomAwareEnabled();
+        const bool adaptiveOn = Mod::get()->getSettingValue<bool>("adaptive-budget");
+        const char* preset = performancePresetName(performancePreset());
+        setStateLabel(m_fields->autoLabel, autoOn ? "AUTO PLAY: ON" : "AUTO PLAY: OFF", autoOn);
+        setStateLabel(m_fields->trajLabel, trajOn ? "TRAJECTORY: ON" : "TRAJECTORY: OFF", trajOn);
+        setStateLabel(m_fields->waveLabel, waveOn ? "WAVE ASSIST: ON" : "WAVE ASSIST: OFF", waveOn);
+        setStateLabel(m_fields->adaptiveLabel, adaptiveOn ? "AUTO-SAVE FPS: ON" : "AUTO-SAVE FPS: OFF", adaptiveOn);
+        if (m_fields->performanceLabel) {
+            m_fields->performanceLabel->setString(fmt::format("PERFORMANCE: {}  >", preset).c_str());
+        }
+        if (m_fields->statusLabel) {
+            m_fields->statusLabel->setString(fmt::format(
+                "Auto {} | Path {} | {}", autoOn ? "ON" : "OFF", trajOn ? "ON" : "OFF", preset
+            ).c_str());
+        }
+    }
+
+    void savePanelState() {
+        if (!m_fields->panel) return;
+        auto pos = m_fields->panel->getPosition();
+        Mod::get()->setSavedValue<float>("panel-x", pos.x);
+        Mod::get()->setSavedValue<float>("panel-y", pos.y);
+        Mod::get()->setSavedValue<bool>("panel-collapsed", m_fields->panelCollapsed);
+    }
+
+    // Keeps the whole panel on screen (also after rotating / different resolution).
+    void clampPanelToScreen() {
+        if (!m_fields->panel) return;
+        auto size = cocos2d::CCDirector::sharedDirector()->getWinSize();
+        const float height = m_fields->panelCollapsed ? at::ui::kPanelCollapsedHeight : at::ui::kPanelExpandedHeight;
+        auto pos = m_fields->panel->getPosition();
+        pos.x = std::clamp(pos.x, 0.f, std::max(0.f, size.width - at::ui::kPanelWidth));
+        pos.y = std::clamp(pos.y, 0.f, std::max(0.f, size.height - height));
+        m_fields->panel->setPosition(pos);
+    }
+
     void updatePanelLayout() {
         if (!m_fields->panel) return;
-        const float height = m_fields->panelCollapsed ? 34.f : 156.f;
-        m_fields->panel->setContentSize({190.f, height});
+        const float height = m_fields->panelCollapsed ? at::ui::kPanelCollapsedHeight : at::ui::kPanelExpandedHeight;
+        m_fields->panel->setContentSize({at::ui::kPanelWidth, height});
+        const float cx = at::ui::kPanelWidth * 0.5f;
         if (m_fields->headerLabel) {
-            m_fields->headerLabel->setPosition({95.f, height - 13.f});
+            // Header is also the drag handle; collapsed state shows a compact status line below it.
+            m_fields->headerLabel->setPosition({cx, height - 13.f});
             m_fields->headerLabel->setString(
-                m_fields->panelCollapsed ? "AUTO TRAJECTORY  [+]" : "AUTO TRAJECTORY  [drag / hide]"
+                m_fields->panelCollapsed ? "AUTO TRAJECTORY  [+]" : "AUTO TRAJECTORY  [-]"
             );
+        }
+        if (m_fields->statusLabel) {
+            m_fields->statusLabel->setVisible(m_fields->panelCollapsed);
+            m_fields->statusLabel->setPosition({cx, 8.f});
         }
         if (m_fields->scanLabel) {
             m_fields->scanLabel->setVisible(!m_fields->panelCollapsed);
-            m_fields->scanLabel->setPosition({95.f, 126.f});
+            m_fields->scanLabel->setPosition({cx, 126.f});
         }
         if (m_fields->metricsLabel) {
             m_fields->metricsLabel->setVisible(!m_fields->panelCollapsed);
-            m_fields->metricsLabel->setPosition({95.f, 108.f});
+            m_fields->metricsLabel->setPosition({cx, 108.f});
         }
         if (m_fields->menu) m_fields->menu->setVisible(!m_fields->panelCollapsed);
+        this->clampPanelToScreen();
+        this->savePanelState();
     }
 
     void setupFloatingPanel() {
         auto panel = cocos2d::CCLayerColor::create(
-            cocos2d::ccColor4B{13, 18, 26, 232}, 190.f, 156.f
+            cocos2d::ccColor4B{13, 18, 26, 232}, at::ui::kPanelWidth, at::ui::kPanelExpandedHeight
         );
         if (!panel) return;
         panel->setAnchorPoint({0.f, 0.f});
         panel->setID("autotraj-floating-panel"_spr);
-        panel->setPosition({112.f, 105.f});
+        panel->setPosition({
+            Mod::get()->getSavedValue<float>("panel-x", 112.f),
+            Mod::get()->getSavedValue<float>("panel-y", 105.f)
+        });
+        m_fields->panelCollapsed = Mod::get()->getSavedValue<bool>("panel-collapsed", false);
         this->addChild(panel, 1001);
         m_fields->panel = panel;
 
-        auto header = cocos2d::CCLabelBMFont::create("AUTO TRAJECTORY  [drag / hide]", "bigFont.fnt");
+        auto header = cocos2d::CCLabelBMFont::create("AUTO TRAJECTORY  [-]", "bigFont.fnt");
         header->setScale(0.38f);
-        header->setPosition({95.f, 143.f});
+        header->setPosition({at::ui::kPanelWidth * 0.5f, 143.f});
         panel->addChild(header, 2);
         m_fields->headerLabel = header;
 
+        auto status = cocos2d::CCLabelBMFont::create("", "bigFont.fnt");
+        status->setScale(0.27f);
+        status->setPosition({at::ui::kPanelWidth * 0.5f, 8.f});
+        panel->addChild(status, 2);
+        m_fields->statusLabel = status;
+
         auto scan = cocos2d::CCLabelBMFont::create("ROUTE SCAN: READY", "bigFont.fnt");
         scan->setScale(0.32f);
-        scan->setPosition({95.f, 126.f});
+        scan->setPosition({at::ui::kPanelWidth * 0.5f, 126.f});
         panel->addChild(scan, 2);
         m_fields->scanLabel = scan;
 
-        auto metrics = cocos2d::CCLabelBMFont::create("PERF: LOW | BUDGET: 450us", "bigFont.fnt");
+        auto metrics = cocos2d::CCLabelBMFont::create("FPS --", "bigFont.fnt");
         metrics->setScale(0.27f);
-        metrics->setPosition({95.f, 108.f});
+        metrics->setPosition({at::ui::kPanelWidth * 0.5f, 108.f});
         panel->addChild(metrics, 2);
         m_fields->metricsLabel = metrics;
 
@@ -468,9 +534,9 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         auto menu = cocos2d::CCMenu::create(
             autoItem, trajItem, waveItem, perfItem, adaptiveItem, nullptr
         );
-        menu->alignItemsVerticallyWithPadding(1.f);
-        menu->setPosition({95.f, 53.f});
-        menu->setScale(0.68f);
+        menu->alignItemsVerticallyWithPadding(3.f);
+        menu->setPosition({at::ui::kPanelWidth * 0.5f, 53.f});
+        menu->setScale(0.78f);
         menu->setID("autotraj-menu"_spr);
         panel->addChild(menu, 2);
 
@@ -483,11 +549,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->lastAuto = autoPlayEnabled();
         m_fields->lastTraj = trajectoryEnabled();
         m_fields->lastUi = uiEnabled();
-        autoLabel->setString(m_fields->lastAuto ? "AUTO PLAY: ON" : "AUTO PLAY: OFF");
-        trajLabel->setString(m_fields->lastTraj ? "TRAJECTORY: ON" : "TRAJECTORY: OFF");
-        waveLabel->setString(waveRoomAwareEnabled() ? "WAVE PLAN: ON" : "WAVE PLAN: OFF");
-        perfLabel->setString(fmt::format("PERF PRESET: {}  >", performancePresetName(performancePreset())).c_str());
-        adaptiveLabel->setString(Mod::get()->getSettingValue<bool>("adaptive-budget") ? "ADAPTIVE BUDGET: ON" : "ADAPTIVE BUDGET: OFF");
+        this->refreshPanelLabels();
         panel->setVisible(m_fields->lastUi);
         this->updatePanelLayout();
 
@@ -499,6 +561,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         );
         if (touchLayer) {
             touchLayer->setID("autotraj-panel-touch"_spr);
+            touchLayer->setOnDragEnd([this]() { this->savePanelState(); });
             this->addChild(touchLayer, 1002);
             m_fields->panelTouch = touchLayer;
         }
@@ -519,29 +582,21 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         value = (value + 1) % 4;
         Mod::get()->setSettingValue<int64_t>("performance-preset", value);
         m_fields->scheduler.setSettings(performanceSettings());
-        if (m_fields->performanceLabel) {
-            m_fields->performanceLabel->setString(
-                fmt::format("PERF PRESET: {}  >", performancePresetName(performancePreset())).c_str()
-            );
-        }
+        this->refreshPanelLabels();
     }
 
     void onToggleAdaptiveBudget(CCObject*) {
         const bool value = !Mod::get()->getSettingValue<bool>("adaptive-budget");
         Mod::get()->setSettingValue<bool>("adaptive-budget", value);
         m_fields->scheduler.setSettings(performanceSettings());
-        if (m_fields->adaptiveLabel) {
-            m_fields->adaptiveLabel->setString(value ? "ADAPTIVE BUDGET: ON" : "ADAPTIVE BUDGET: OFF");
-        }
+        this->refreshPanelLabels();
     }
 
     void onToggleWavePlanner(CCObject*) {
         bool value = !waveRoomAwareEnabled();
         Mod::get()->setSettingValue<bool>("wave-room-aware", value);
         this->cancelWaveTransition();
-        if (m_fields->waveLabel) {
-            m_fields->waveLabel->setString(value ? "WAVE PLAN: ON" : "WAVE PLAN: OFF");
-        }
+        this->refreshPanelLabels();
     }
 
     void releaseBot() {
@@ -630,10 +685,10 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                 perfMetrics.jumpGraceActive);
         }
         if (m_fields->metricsLabel && m_fields->scheduler.mayRun(AdaptiveScheduler::WorkClass::UI)) {
+            const double ms = perfMetrics.averageFrameMs;
             m_fields->metricsLabel->setString(fmt::format(
-                "{} | {:d}us | {:.1f}ms{}",
-                performancePresetName(performancePreset()), perfMetrics.currentBudgetUs,
-                perfMetrics.averageFrameMs, perfMetrics.jumpGraceActive ? " | JUMP SAFE" : ""
+                "FPS {:.0f}{}", ms > 0.01 ? 1000.0 / ms : 0.0,
+                perfMetrics.jumpGraceActive ? "  |  JUMP SAFE" : ""
             ).c_str());
         }
 
@@ -647,16 +702,12 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         const bool uiOn = uiEnabled();
 
         if (autoOn != m_fields->lastAuto) {
-            if (m_fields->autoLabel) {
-                m_fields->autoLabel->setString(autoOn ? "AUTO PLAY: ON" : "AUTO PLAY: OFF");
-            }
+            this->refreshPanelLabels();
             m_fields->lastAuto = autoOn;
         }
 
         if (trajOn != m_fields->lastTraj) {
-            if (m_fields->trajLabel) {
-                m_fields->trajLabel->setString(trajOn ? "TRAJECTORY: ON" : "TRAJECTORY: OFF");
-            }
+            this->refreshPanelLabels();
             if (m_fields->drawNode) {
                 m_fields->drawNode->setVisible(trajOn);
             }
@@ -1017,6 +1068,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->performanceLabel = nullptr;
         m_fields->adaptiveLabel = nullptr;
         m_fields->metricsLabel = nullptr;
+        m_fields->statusLabel = nullptr;
 
         PlayLayer::onQuit();
     }
