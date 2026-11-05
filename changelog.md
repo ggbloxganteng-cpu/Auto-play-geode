@@ -1,3 +1,46 @@
+# v0.6.0
+
+- Split portable simulation logic into `src/core/Simulation.hpp` and added `src/core/LevelScan.hpp` for level object indexing.
+- Added a four-zone (0/25/50/75/100%) static level pre-scan with per-zone hazard, orb, pad and portal counts.
+- Added live zone/progress reporting to the in-game panel and Geode log. Zone summaries are informational; the existing controller continues to re-plan from the live player state and does not yet score routes using future zone counts.
+- Replaced the fixed in-game control stack with a draggable, collapsible floating panel. Header drag moves it; header tap collapses or expands it. Touch handling is isolated in `src/ui/FloatingPanelTouch.hpp` and uses the Cocos2d-x 2.x targeted-touch delegate path.
+- Added a lightweight Wave profile (four candidates / 108 steps) and an optional deep profile (six candidates / 144 steps). Light is cheaper but less reliable in some synthetic tight corridors; deep preserves more search breadth. The planner remains disabled by default.
+- Updated offline tests to compile the actual simulation header and added level-zone scanner tests.
+- The scanner is not a complete level clone: future dynamic object/trigger states are not simulated in parallel. The controller still uses live-state receding-horizon predictions.
+
+# v0.5.6
+
+- Reduce Wave experimental cost with a two-stage search: evaluate the two
+  straight inputs first and skip correction simulations whenever either path
+  survives the horizon. Only test four correction patterns if both straight
+  paths fail; cap the horizon at 144 physics substeps and candidates at six.
+- Add a compact in-game floating control stack for Auto Play, Trajectory and
+  Wave Planner toggles. Detailed numeric settings remain in Geode settings.
+- Keep Wave Planner opt-in; the lightweight randomized benchmark improves
+  worst-case simulation work from roughly 7–8x to about 2.5–3.5x classic in
+  this test harness, while the very-tight toy layouts show only a modest
+  survival improvement. Real-level performance still needs device testing.
+- Document staged 25% checkpoint planning as future work: current simulations
+  use hidden player clones against the live level collision objects; they do
+  not make a fully independent copy of every level object or run safely in
+  parallel because simulation state and object activation are shared.
+
+# v0.5.5
+
+- Add orb hitbox-contact telemetry, separated from confirmed `ringJump()`
+  activation so overlap alone is not treated as a successful click.
+- Compare immediate and nearby frame-aligned delayed orb taps. Prefer the
+  immediate click when it is equally safe; otherwise schedule the selected
+  delayed click in live gameplay and cancel stale schedules if the release path
+  can no longer reach the planned timing window.
+- Continue hidden-clone prediction through mini/normal size portals using the
+  game's collision path, allowing the post-size-transition Ship physics to be
+  evaluated in narrow gaps. Mode, dual and teleport portals remain prediction
+  boundaries.
+- Preserve object activation state after each prediction and keep jump-pad
+  handling unchanged. Add offline regression coverage for orb contact versus
+  activation, immediate/delayed selection, scheduled clicks and size portals.
+
 # v0.5.4
 
 - Fix Cube's repeated-defer bug: it now tests Tap-now first and commits when

@@ -8,9 +8,9 @@
 	},
 	"id": "yourname.auto-trajectory",
 	"name": "Auto Trajectory",
-	"version": "v0.5.4",
+	"version": "v0.6.0",
 	"developer": "yourname",
-	"description": "Auto play bot with a live jump trajectory overlay.",
+	"description": "Predictive auto play with a four-zone level pre-scan, route telemetry and a draggable in-game control panel.",
 	"links": {
 		"source": "https://github.com/yourname/auto-trajectory"
 	},
@@ -64,7 +64,7 @@
 		"wave-room-aware": {
 			"type": "bool",
 			"name": "Wave: Predictive Path Planner",
-			"description": "Optional frame-aligned Wave search with earlier one- and two-correction patterns. Much heavier than the classic controller; enable only when testing Wave.",
+			"description": "Lightweight frame-aligned Wave search with four bounded candidates over a 108-step horizon. Search breadth is reduced; results vary by corridor. Experimental and disabled by default.",
 			"default": false
 		},
 		"ui-title": {
@@ -73,8 +73,8 @@
 		},
 		"show-ui": {
 			"type": "bool",
-			"name": "Show In-Game Buttons",
-			"description": "Shows the Auto Play / Trajectory toggle buttons while playing.",
+			"name": "Show Floating Controls",
+			"description": "Shows a draggable, collapsible in-game panel for Auto Play, Trajectory, Wave Planner and route scan status.",
 			"default": true
 		},
 		"debug-title": {
@@ -85,6 +85,12 @@
 			"type": "bool",
 			"name": "Debug Log",
 			"description": "Writes the bot's decisions to the Geode log whenever its action changes (and every few frames near a hazard). Turn on and send the log if the bot misbehaves.",
+			"default": false
+		},
+		"wave-deep-search": {
+			"type": "bool",
+			"name": "Wave: Deeper Search",
+			"description": "Uses four correction probes after the two straight paths fail and extends the horizon to 144 steps (six total candidates). Can help in some tight corridors but costs more CPU; off by default.",
 			"default": false
 		}
 	}
