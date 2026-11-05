@@ -8,7 +8,7 @@
 	},
 	"id": "yourname.auto-trajectory",
 	"name": "Auto Trajectory",
-	"version": "v0.5.2",
+	"version": "v0.5.4",
 	"developer": "yourname",
 	"description": "Auto play bot with a live jump trajectory overlay.",
 	"links": {
@@ -22,7 +22,7 @@
 		"auto-play": {
 			"type": "bool",
 			"name": "Auto Play",
-			"description": "Predictive auto play for cube/robot/ball, ship/UFO/swing/wave and dual mode. Tap input edges are synchronized with prediction; robot holds are frame-timed. Not available in platformer levels.",
+			"description": "Predictive auto play for cube/robot/ball, ship/UFO/swing/wave and dual mode. Cube and Ball commit to immediately safe input pulses; Robot uses finite hold probes. Not available in platformer levels.",
 			"default": false
 		},
 		"show-trajectory": {
@@ -63,8 +63,8 @@
 		},
 		"wave-room-aware": {
 			"type": "bool",
-			"name": "Wave: Roomy Path (experimental)",
-			"description": "Wave tries several hold/release patterns and prefers the one with the most room around it. Uses several times more CPU than the default wave bot, so it may lower FPS on weaker phones.",
+			"name": "Wave: Predictive Path Planner",
+			"description": "Optional frame-aligned Wave search with earlier one- and two-correction patterns. Much heavier than the classic controller; enable only when testing Wave.",
 			"default": false
 		},
 		"ui-title": {

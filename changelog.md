@@ -1,3 +1,39 @@
+# v0.5.4
+
+- Fix Cube's repeated-defer bug: it now tests Tap-now first and commits when
+  that one-frame pulse survives the full prediction horizon. A later safe tap
+  is considered only when Tap-now fails.
+- Apply the same current-first rule to Robot finite holds and Ball gravity
+  flips, preventing safe immediate actions from being postponed indefinitely.
+- Keep Tap pulses to one rendered frame; this clears the old long lock-held
+  behavior even when the player is airborne.
+- Refine the optional Wave planner to include one-frame and two-frame early
+  corrections. On the very-tight randomized test set, deaths fell from
+  146/300 to 41/300 (lookahead 132) and 143/300 to 37/300 (lookahead 200),
+  while simulation work rose to roughly 6–8 times the classic controller.
+- Orb activation still requires simulated Jump input and checks per-player
+  used flags. Custom/event-linked ring behavior remains a known limitation.
+- Pad handling is unchanged.
+
+# v0.5.3
+
+- Fix Cube fallback choosing Hold even when Tap was the best surviving option.
+- Replace the long 180-substep Tap lock with an exact one-rendered-frame pulse.
+  Airborne taps now release normally instead of waiting for a grounded transition.
+- Make simulated Tap use the same one-frame pulse for grounded jumps, airborne
+  orb contacts, Ball gravity flips and Spider input.
+- Require simulated Jump input to be down before a standard RingObject can be
+  activated; respect per-player used flags to reduce false positives.
+- Add a dedicated Ball planner that compares gravity-flip pulse timing rather
+  than reusing Cube's jump controller.
+- Add denser, shorter Robot hold durations for more precise jump-height choices,
+  and re-plan immediately when a timed hold expires to avoid skipping a landing window.
+- Replace fixed wave intervals with frame-aligned one/two-correction patterns,
+  extend the planning horizon to 192 substeps. The planner remains opt-in due
+  to its higher CPU cost and inconsistent randomized survival gains.
+- Expand offline checks for airborne tap release, orb input gating and Ball edge pulses.
+- Pad handling is unchanged.
+
 # v0.5.2
 
 - Check later tap windows before selecting an immediate Cube jump, reducing avoidable early jumps.

@@ -12,7 +12,7 @@ endif()
 
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-project(AutoTrajectory VERSION 0.5.0)
+project(AutoTrajectory VERSION 0.5.4)
 
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
