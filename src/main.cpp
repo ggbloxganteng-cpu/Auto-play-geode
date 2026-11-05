@@ -7,7 +7,13 @@
 #include <Geode/modify/GameObject.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <initializer_list>
+#include <iterator>
+#include <utility>
+#include <unordered_set>
+#include <vector>
 
 using namespace geode::prelude;
 
@@ -47,6 +53,20 @@ namespace {
     bool g_simDead = false;
     bool g_simPortal = false;
     PlayerObject* g_simDummies[2] = {nullptr, nullptr};
+
+    // Objects touched by a predictive clone are snapshotted and restored after
+    // each run. This prevents a simulated orb/pad/portal from consuming the
+    // real level object's activation state.
+    struct SimObjectSnapshot {
+        GameObject* object = nullptr;
+        bool isActivated = false;
+        EffectGameObject* effect = nullptr;
+        bool effectActivated = false;
+        bool activatedByPlayer1 = false;
+        bool activatedByPlayer2 = false;
+    };
+    std::vector<SimObjectSnapshot> g_simObjectSnapshots;
+    std::unordered_set<GameObject*> g_simTouchedObjects;
     float g_stepDt = 0.25f;
     bool g_warnedStepZero = false;
 
@@ -64,9 +84,8 @@ namespace {
     constexpr int kTapProbeBack = 35;      // probe a tap this many substeps before the first hazard
     constexpr int kTapBudgetSteps = 180;   // max substeps an in-flight tap may wait for its landing
     constexpr int kFlySwitchMargin = 2;    // flying: switch input only if clearly better (anti-flap)
-    constexpr int kWaveMaxSteps = 160;     // wave planning horizon cap (keeps the many candidate sims cheap)
-    constexpr int kWavePulseA = 14;        // wave candidates: switch input after this many substeps
-    constexpr int kWavePulseB = 40;
+    constexpr int kWaveMaxSteps = 160;     // bounded planning horizon for the multi-pattern wave search
+    constexpr int kWaveRoomOffsetA = 8;    // robustness probe: small vertical perturbations
 
     const cocos2d::ccColor4F kNoColor{0.f, 0.f, 0.f, 0.f};
 
@@ -90,9 +109,20 @@ namespace {
         }
     }
 
-    bool nearPortal(PlayerObject* player, GameObject* portal) {
-        return std::fabs(player->getPositionX() - portal->getPositionX()) < 20.f &&
-               std::fabs(player->getPositionY() - portal->getPositionY()) < 60.f;
+    // These portals change the player's collision shape or control mode. The
+    // clone is allowed to enter them, then planning re-syncs from the real player
+    // on the next frame instead of pretending the old mode continues forever.
+    bool requiresPortalResync(int id) {
+        switch (id) {
+            case 12: case 13: case 47: case 111: // ball, ship, UFO, wave
+            case 660: case 745: case 1331:      // robot, spider, swing
+            case 99: case 101:                  // size
+            case 286: case 287:                 // dual
+            case 747:                           // teleport
+                return true;
+            default:
+                return false;
+        }
     }
 
     bool isFlyingMode(PlayerObject* p) {
@@ -113,6 +143,7 @@ namespace {
 
     void syncDummy(PlayerObject* dummy, PlayerObject* source) {
         dummy->setVisible(false);
+        dummy->resetTouchedRings(true);
         dummy->copyAttributes(source);
         dummy->setScale(source->getScale());
         dummy->setContentSize(source->getContentSize());
@@ -123,7 +154,79 @@ namespace {
         dummy->m_isUpsideDown = source->m_isUpsideDown;
         dummy->m_vehicleSize = source->m_vehicleSize;
         dummy->m_playerSpeed = source->m_playerSpeed;
+        // copy input / special-interaction state: an incomplete clone can miss
+        // an orb already under the player or replay a buffered button edge.
+        dummy->m_isDashing = source->m_isDashing;
+        dummy->m_lastActivatedPortal = source->m_lastActivatedPortal;
+        dummy->m_holdingButtons = source->m_holdingButtons;
+        dummy->m_jumpBuffered = source->m_jumpBuffered;
+        dummy->m_wasJumpBuffered = source->m_wasJumpBuffered;
+        dummy->m_stateJumpBuffered = source->m_stateJumpBuffered;
+        dummy->m_stateRingJump = source->m_stateRingJump;
+        dummy->m_stateRingJump2 = source->m_stateRingJump2;
+        dummy->m_wasRobotJump = source->m_wasRobotJump;
+        dummy->m_touchedRing = source->m_touchedRing;
+        dummy->m_touchedPad = source->m_touchedPad;
+        dummy->m_touchedGravityPortal = source->m_touchedGravityPortal;
         dummy->m_isDead = false;
+    }
+
+    void snapshotSimObject(GameObject* object) {
+        if (!object || !g_simTouchedObjects.insert(object).second) return;
+        SimObjectSnapshot state;
+        state.object = object;
+        state.isActivated = object->m_isActivated;
+        if (auto* effect = typeinfo_cast<EffectGameObject*>(object)) {
+            state.effect = effect;
+            state.effectActivated = effect->m_activated;
+            state.activatedByPlayer1 = effect->m_activatedByPlayer1;
+            state.activatedByPlayer2 = effect->m_activatedByPlayer2;
+        }
+        g_simObjectSnapshots.push_back(state);
+    }
+
+    void restoreSimObjects() {
+        for (auto const& state : g_simObjectSnapshots) {
+            if (!state.object) continue;
+            state.object->m_isActivated = state.isActivated;
+            if (state.effect) {
+                state.effect->m_activated = state.effectActivated;
+                state.effect->m_activatedByPlayer1 = state.activatedByPlayer1;
+                state.effect->m_activatedByPlayer2 = state.activatedByPlayer2;
+            }
+        }
+        g_simObjectSnapshots.clear();
+        g_simTouchedObjects.clear();
+    }
+
+    bool isSimInteractable(GameObject* object) {
+        if (!object) return false;
+        switch (object->m_objectType) {
+            case GameObjectType::YellowJumpPad:
+            case GameObjectType::PinkJumpPad:
+            case GameObjectType::RedJumpPad:
+            case GameObjectType::GravityPad:
+            case GameObjectType::SpiderPad:
+            case GameObjectType::YellowJumpRing:
+            case GameObjectType::PinkJumpRing:
+            case GameObjectType::RedJumpRing:
+            case GameObjectType::GravityRing:
+            case GameObjectType::GreenRing:
+            case GameObjectType::DropRing:
+            case GameObjectType::CustomRing:
+            case GameObjectType::DashRing:
+            case GameObjectType::GravityDashRing:
+            case GameObjectType::SpiderOrb:
+            case GameObjectType::InverseGravityPortal:
+            case GameObjectType::NormalGravityPortal:
+            case GameObjectType::GravityTogglePortal:
+                return true;
+            default:
+                // Gravity and speed portals are handled by the normal collision
+                // path. Complex mode/size/dual/teleport portals are boundaries.
+                return isPortalId(object->m_objectID) &&
+                       !requiresPortalResync(object->m_objectID);
+        }
     }
 }
 
@@ -140,7 +243,14 @@ struct SimResult {
 enum class SimPlan {
     Release, // never press
     Hold,    // press after the delay; hold forever (or for holdSteps)
-    Tap      // press after the delay, let go as soon as the player has left the ground
+    Tap,     // press after the delay, let go as soon as the player has left the ground
+    WavePattern // follow a bounded hold/release sequence used by wave pathfinding
+};
+
+struct WavePlan {
+    bool startHolding = false;
+    int switchCount = 0;
+    std::array<int, 8> switchSteps{};
 };
 
 // What the bot should physically do this frame. The REAL input mirrors the
@@ -172,7 +282,8 @@ SimResult runSimulation(
     int maxSteps,
     int drawSteps,
     cocos2d::CCDrawNode* draw,
-    cocos2d::ccColor4F color
+    cocos2d::ccColor4F color,
+    WavePlan const* wavePlan = nullptr
 ) {
     SimResult result;
     PlayLayer* pl = rig.pl;
@@ -187,6 +298,8 @@ SimResult runSimulation(
     g_simulating = true;
     g_simDead = false;
     g_simPortal = false;
+    g_simObjectSnapshots.clear();
+    g_simTouchedObjects.clear();
     g_simDummies[0] = d1;
     g_simDummies[1] = d2;
 
@@ -223,6 +336,7 @@ SimResult runSimulation(
     const bool flying = isFlyingMode(s1);
     bool pressed = false;
     bool released = false;
+    bool waveInputDown = false;
     bool tapArmed = false;
     bool jumped = false;
     int airborneStreak = 0;
@@ -242,15 +356,27 @@ SimResult runSimulation(
 
     for (int i = 0; i < maxSteps; ++i) {
         ++g_simStepCount;
-        if (plan != SimPlan::Release && !pressed && i >= pressDelay) {
-            pressAll();
-            pressed = true;
-            tapArmed = d1->m_isOnGround;
-        }
-        if (plan == SimPlan::Hold && pressed && !released && holdSteps >= 0 &&
-            i >= pressDelay + holdSteps) {
-            releaseAll();
-            released = true;
+        if (plan == SimPlan::WavePattern && wavePlan) {
+            bool desiredDown = wavePlan->startHolding;
+            for (int change = 0; change < wavePlan->switchCount; ++change) {
+                if (i >= wavePlan->switchSteps[change]) desiredDown = !desiredDown;
+            }
+            if (desiredDown != waveInputDown) {
+                if (desiredDown) pressAll();
+                else releaseAll();
+                waveInputDown = desiredDown;
+            }
+        } else {
+            if (plan != SimPlan::Release && !pressed && i >= pressDelay) {
+                pressAll();
+                pressed = true;
+                tapArmed = d1->m_isOnGround;
+            }
+            if (plan == SimPlan::Hold && pressed && !released && holdSteps >= 0 &&
+                i >= pressDelay + holdSteps) {
+                releaseAll();
+                released = true;
+            }
         }
 
         d1->update(dt);
@@ -308,6 +434,7 @@ SimResult runSimulation(
     }
 
     releaseAll();
+    restoreSimObjects();
     d1->setVisible(false);
     if (d2) d2->setVisible(false);
 
@@ -321,6 +448,10 @@ static SimResult probe(
     SimRig const& rig, SimPlan plan, int delay, int holdSteps, int steps
 ) {
     return runSimulation(rig, plan, delay, holdSteps, steps, 0, nullptr, kNoColor);
+}
+
+static SimResult probeWave(SimRig const& rig, WavePlan const& plan, int steps) {
+    return runSimulation(rig, SimPlan::WavePattern, 0, -1, steps, 0, nullptr, kNoColor, &plan);
 }
 
 // Cube / ball / robot / spider: jump at the last moment a jump still works.
@@ -455,97 +586,154 @@ static BotAction decideWaveClassic(
     return currentlyHolding ? BotAction::Hold : BotAction::Release;
 }
 
-// Wave (experimental setting): choose the roomiest path, not just any path that survives.
-//
-// Candidates are "hold, then release" / "release, then hold" with one switch
-// (or none). Every candidate that survives the lookahead is then re-tested
-// with the player shifted up and down by growing amounts; candidates that
-// only fit when the wave is exactly on the line are dropped first. Whatever
-// is left wins, and the current input is kept when it is still among them.
+// Wave planner: test short multi-switch sequences instead of only comparing
+// permanent hold/release or a single switch. A small robustness pass favors
+// paths that still survive when the starting Y position is perturbed.
 static BotAction decideWave(
-    SimRig const& rig, SimResult const& idle, int lookahead, bool currentlyHolding
+    SimRig const& rig, SimResult const& idle, int lookahead, bool currentlyHolding,
+    WavePlan* selectedPlan = nullptr
 ) {
+    if (selectedPlan) *selectedPlan = WavePlan{};
     const int botSteps = std::min(lookahead, kWaveMaxSteps);
-    const bool idleDied = idle.died && idle.survived < botSteps;
 
-    // No hazard on either straight path: keep flying the way we are.
-    SimResult hold = probe(rig, SimPlan::Hold, 0, -1, botSteps);
-    if (!hold.died && !idleDied) {
+    // In open space both straight inputs are safe. Do not perturb a stable
+    // wave line merely because a more complicated sequence also survives.
+    SimResult holdStraight = probe(rig, SimPlan::Hold, 0, -1, botSteps);
+    if (!idle.died && idle.survived >= botSteps &&
+        !holdStraight.died && holdStraight.survived >= botSteps) {
         return currentlyHolding ? BotAction::Hold : BotAction::Release;
     }
 
-    struct Cand { bool startHold; int sw; bool alive; int survived; };
-    Cand cands[6] = {
-        {true, -1, false, 0}, {true, kWavePulseA, false, 0}, {true, kWavePulseB, false, 0},
-        {false, -1, false, 0}, {false, kWavePulseA, false, 0}, {false, kWavePulseB, false, 0},
+    struct Candidate {
+        WavePlan plan;
+        bool alive = false;
+        int survived = 0;
+        int roomPasses = -1;
+        int switches = 0;
+    };
+    Candidate candidates[12];
+    int count = 0;
+    auto add = [&](bool startHold, std::initializer_list<int> changes) {
+        if (count >= static_cast<int>(std::size(candidates))) return;
+        Candidate& candidate = candidates[count++];
+        candidate.plan.startHolding = startHold;
+        candidate.plan.switchCount = 0;
+        int previous = 0;
+        for (int at : changes) {
+            if (at <= previous || at >= botSteps || candidate.plan.switchCount >= 8) continue;
+            candidate.plan.switchSteps[candidate.plan.switchCount++] = at;
+            previous = at;
+        }
+        candidate.switches = candidate.plan.switchCount;
     };
 
-    auto run = [&](SimRig const& r, Cand const& c) {
-        if (c.startHold) return probe(r, SimPlan::Hold, 0, c.sw, botSteps);
-        if (c.sw < 0) return probe(r, SimPlan::Release, 0, -1, botSteps);
-        return probe(r, SimPlan::Hold, c.sw, -1, botSteps);
-    };
-
-    bool any = false;
-    int bestHold = 0;
-    int bestRelease = 0;
-    for (Cand& c : cands) {
-        SimResult r = run(rig, c);
-        c.alive = !r.died;
-        c.survived = r.survived;
-        any = any || c.alive;
-        if (c.startHold) bestHold = std::max(bestHold, r.survived);
-        else bestRelease = std::max(bestRelease, r.survived);
+    // Stable paths and one-switch timing windows.
+    add(false, {});
+    add(true, {});
+    for (int at : {16, 32, 48}) {
+        add(false, {at});
+        add(true, {at});
     }
 
-    if (!any) {
-        // Squeezed: switch only if one side clearly lasts longer.
-        if (bestHold > bestRelease + kFlySwitchMargin) return BotAction::Hold;
-        if (bestRelease > bestHold + kFlySwitchMargin) return BotAction::Release;
+    // A second switch permits a recovery turn after the first correction.
+    add(false, {12, 32});
+    add(true, {12, 32});
+
+    // One compact pulse train handles passages that require repeated changes.
+    for (bool startHold : {false, true}) {
+        WavePlan plan;
+        plan.startHolding = startHold;
+        for (int at = 12; at < botSteps && plan.switchCount < 8; at += 12) {
+            plan.switchSteps[plan.switchCount++] = at;
+        }
+        Candidate& candidate = candidates[count++];
+        candidate.plan = plan;
+        candidate.switches = plan.switchCount;
+    }
+
+    bool anyAlive = false;
+    int bestHoldSurvival = 0;
+    int bestReleaseSurvival = 0;
+    for (int i = 0; i < count; ++i) {
+        SimResult result = probeWave(rig, candidates[i].plan, botSteps);
+        candidates[i].alive = !result.died;
+        candidates[i].survived = result.survived;
+        anyAlive = anyAlive || candidates[i].alive;
+        if (candidates[i].plan.startHolding) {
+            bestHoldSurvival = std::max(bestHoldSurvival, result.survived);
+        } else {
+            bestReleaseSurvival = std::max(bestReleaseSurvival, result.survived);
+        }
+    }
+
+    if (!anyAlive) {
+        if (bestHoldSurvival > bestReleaseSurvival + kFlySwitchMargin) return BotAction::Hold;
+        if (bestReleaseSurvival > bestHoldSurvival + kFlySwitchMargin) return BotAction::Release;
         return currentlyHolding ? BotAction::Hold : BotAction::Release;
     }
 
-    static constexpr float kRoom[3] = {5.f, 10.f, 16.f};
-    for (float room : kRoom) {
-        bool pass[6] = {false, false, false, false, false, false};
-        bool anyPass = false;
+    // Evaluate only the best two survivors with a small vertical perturbation;
+    // this bounds CPU use on mobile while still rejecting fragile trajectories.
+    for (int pass = 0; pass < 2; ++pass) {
+        int bestIndex = -1;
+        for (int i = 0; i < count; ++i) {
+            if (!candidates[i].alive || candidates[i].roomPasses >= 0) continue;
+            if (bestIndex < 0 || candidates[i].survived > candidates[bestIndex].survived ||
+                (candidates[i].survived == candidates[bestIndex].survived &&
+                 candidates[i].switches < candidates[bestIndex].switches)) {
+                bestIndex = i;
+            }
+        }
+        if (bestIndex < 0) break;
+        Candidate& candidate = candidates[bestIndex];
+        candidate.roomPasses = 0;
         SimRig up = rig;
         SimRig down = rig;
-        up.yOffset = room;
-        down.yOffset = -room;
-        for (int i = 0; i < 6; ++i) {
-            if (!cands[i].alive) continue;
-            pass[i] = !run(up, cands[i]).died && !run(down, cands[i]).died;
-            anyPass = anyPass || pass[i];
-        }
-        if (!anyPass) break; // nobody has this much room: keep the previous set
-        for (int i = 0; i < 6; ++i) {
-            if (!pass[i]) cands[i].alive = false;
-        }
+        up.yOffset = static_cast<float>(kWaveRoomOffsetA);
+        down.yOffset = -static_cast<float>(kWaveRoomOffsetA);
+        if (!probeWave(up, candidate.plan, botSteps).died) ++candidate.roomPasses;
+        if (!probeWave(down, candidate.plan, botSteps).died) ++candidate.roomPasses;
     }
 
-    bool holdStart = false;
-    bool releaseStart = false;
-    for (Cand const& c : cands) {
-        if (!c.alive) continue;
-        if (c.startHold) holdStart = true;
-        else releaseStart = true;
+    int bestIndex = -1;
+    for (int i = 0; i < count; ++i) {
+        Candidate const& candidate = candidates[i];
+        if (!candidate.alive) continue;
+        if (bestIndex < 0) {
+            bestIndex = i;
+            continue;
+        }
+        Candidate const& best = candidates[bestIndex];
+        bool better = candidate.roomPasses > best.roomPasses;
+        if (candidate.roomPasses == best.roomPasses) {
+            if (candidate.survived > best.survived) better = true;
+            else if (candidate.survived == best.survived && candidate.switches < best.switches) better = true;
+            else if (candidate.survived == best.survived && candidate.switches == best.switches &&
+                     candidate.plan.startHolding == currentlyHolding &&
+                     best.plan.startHolding != currentlyHolding) better = true;
+        }
+        if (better) bestIndex = i;
     }
-    if (currentlyHolding) return holdStart ? BotAction::Hold : BotAction::Release;
-    return releaseStart ? BotAction::Release : BotAction::Hold;
+
+    if (bestIndex < 0) return currentlyHolding ? BotAction::Hold : BotAction::Release;
+    if (selectedPlan) *selectedPlan = candidates[bestIndex].plan;
+    return candidates[bestIndex].plan.startHolding ? BotAction::Hold : BotAction::Release;
 }
 
 // Decides what the bot should do this frame.
 // `idle` is the "release now" simulation (it may be longer than botSteps).
 BotAction decideAutoPress(
-    SimRig const& rig, SimResult const& idle, int botSteps, bool currentlyHolding
+    SimRig const& rig, SimResult const& idle, int botSteps, bool currentlyHolding,
+    WavePlan* selectedWavePlan = nullptr
 ) {
     PlayerObject* p = rig.source;
 
     if (p->m_isDart) {
-        return rig.roomAwareWave
-            ? decideWave(rig, idle, botSteps, currentlyHolding)
-            : decideWaveClassic(rig, idle, botSteps, currentlyHolding);
+        if (rig.roomAwareWave) {
+            return decideWave(rig, idle, botSteps, currentlyHolding, selectedWavePlan);
+        }
+        if (selectedWavePlan) *selectedWavePlan = WavePlan{};
+        return decideWaveClassic(rig, idle, botSteps, currentlyHolding);
     }
 
     // Nothing dangerous inside the lookahead window: stay released.
@@ -575,12 +763,15 @@ class $modify(AutoTrajPlayerObject, PlayerObject) {
     }
 
     void incrementJumps() {
+        // Jump counters belong to the real PlayLayer; do not increment them
+        // while a predictive clone is being evaluated.
         if (g_simulating) return;
         PlayerObject::incrementJumps();
     }
 
     void ringJump(RingObject* ring, bool unk) {
-        if (g_simulating) return;
+        if (g_simulating && !isSimDummy(this)) return;
+        if (g_simulating) snapshotSimObject(ring);
         PlayerObject::ringJump(ring, unk);
     }
 
@@ -613,12 +804,18 @@ class $modify(AutoTrajGameObject, GameObject) {
 
 class $modify(AutoTrajBaseLayer, GJBaseGameLayer) {
     bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
-        if (g_simulating) return false;
+        if (g_simulating) {
+            if (!isSimDummy(player) || !isSimInteractable(object)) return false;
+            snapshotSimObject(object);
+        }
         return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
     }
 
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
-        if (g_simulating) return;
+        if (g_simulating) {
+            if (!isSimDummy(player) || !ring) return;
+            snapshotSimObject(ring);
+        }
         GJBaseGameLayer::playerTouchedRing(player, ring);
     }
 
@@ -626,15 +823,26 @@ class $modify(AutoTrajBaseLayer, GJBaseGameLayer) {
         if (g_simulating && isSimDummy(player) && objects) {
             gd::vector<GameObject*> filtered;
             filtered.reserve(count);
+            auto playerRect = player->getObjectRect();
             for (int i = 0; i < count; ++i) {
                 auto* object = objects->at(i);
                 if (!object) continue;
 
-                // Portals change gravity / mode / speed / size, which the
-                // simulation does not model. Remember that the path reached
-                // one so the prediction stops there instead of guessing.
-                if (isPortalId(object->m_objectID) && nearPortal(player, object)) {
-                    g_simPortal = true;
+                // Use actual hitbox intersection rather than a loose centre-point
+                // radius. Supported portals are passed to the game's collision
+                // code so the clone receives the real portal transition.
+                if (isPortalId(object->m_objectID) &&
+                    playerRect.intersectsRect(object->getObjectRect())) {
+                    snapshotSimObject(object);
+                    if (requiresPortalResync(object->m_objectID)) {
+                        // Stop at the portal instead of pretending the old mode
+                        // continues. The real player crosses it in the live tick;
+                        // the next frame clones the newly transformed state.
+                        g_simPortal = true;
+                        continue;
+                    }
+                    filtered.push_back(object);
+                    continue;
                 }
 
                 switch (object->m_objectType) {
@@ -646,6 +854,10 @@ class $modify(AutoTrajBaseLayer, GJBaseGameLayer) {
                         filtered.push_back(object);
                         break;
                     default:
+                        if (isSimInteractable(object)) {
+                            snapshotSimObject(object);
+                            filtered.push_back(object);
+                        }
                         break;
                 }
             }
@@ -669,6 +881,9 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         cocos2d::CCLabelBMFont* autoLabel = nullptr;
         cocos2d::CCLabelBMFont* trajLabel = nullptr;
         bool botHolding = false;
+        bool waveTransitionActive = false;
+        int waveStepsUntilTransition = 0;
+        bool waveTransitionTarget = false;
         bool botTapActive = false;
         bool botTapGrounded = false;
         int botTapBudget = 0;
@@ -785,6 +1000,12 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->botTapBudget = 0;
     }
 
+    void cancelWaveTransition() {
+        m_fields->waveTransitionActive = false;
+        m_fields->waveStepsUntilTransition = 0;
+        m_fields->waveTransitionTarget = false;
+    }
+
     void destroyPlayer(PlayerObject* player, GameObject* object) override {
         if (g_simulating && isSimDummy(player)) {
             g_simDead = true;
@@ -795,6 +1016,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         if (player == m_player1) {
             m_fields->botHolding = false;
             this->cancelTap();
+            this->cancelWaveTransition();
         }
     }
 
@@ -802,6 +1024,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         PlayLayer::resetLevel();
         m_fields->botHolding = false;
         this->cancelTap();
+        this->cancelWaveTransition();
     }
 
     void playEndAnimationToPos(cocos2d::CCPoint pos) {
@@ -810,7 +1033,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
     }
 
     void flipGravity(PlayerObject* player, bool flip, bool noEffects) {
-        if (g_simulating) return;
+        if (g_simulating && !isSimDummy(player)) return;
         PlayLayer::flipGravity(player, flip, noEffects);
     }
 
@@ -866,6 +1089,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         if (!m_player1 || m_player1->m_isDead || !m_fields->dummy1) {
             this->releaseBot();
             this->cancelTap();
+            this->cancelWaveTransition();
             return;
         }
 
@@ -873,6 +1097,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         if (m_player1->m_isPlatformer) {
             this->releaseBot();
             this->cancelTap();
+            this->cancelWaveTransition();
             return;
         }
 
@@ -890,6 +1115,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         if (horizon <= 0) {
             this->releaseBot();
             this->cancelTap();
+            this->cancelWaveTransition();
             return;
         }
 
@@ -949,9 +1175,49 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         }
 
         if (autoOn) {
-            BotAction action = tapForcedHold
-                ? BotAction::Hold
-                : decideAutoPress(rig, idleResult, botSteps, m_fields->botHolding);
+            BotAction action = BotAction::Release;
+            const bool scheduledWave = m_player1->m_isDart && rig.roomAwareWave;
+            bool waveDidSwitch = false;
+            if (!scheduledWave && m_fields->waveTransitionActive) {
+                this->cancelWaveTransition();
+            }
+            if (tapForcedHold) {
+                action = BotAction::Hold;
+            } else if (scheduledWave && m_fields->waveTransitionActive) {
+                // Execute the first planned switch at a frame boundary. Recheck
+                // the current straight segment; cancel the schedule if the live
+                // state is no longer predicted to survive until that switch.
+                m_fields->waveStepsUntilTransition -= std::max(1, g_frameSubsteps);
+                if (m_fields->waveStepsUntilTransition <= 0) {
+                    action = m_fields->waveTransitionTarget ? BotAction::Hold : BotAction::Release;
+                    this->cancelWaveTransition();
+                    waveDidSwitch = true;
+                } else {
+                    const int checkSteps = std::min(m_fields->waveStepsUntilTransition, botSteps);
+                    SimResult currentPath = probe(
+                        rig, m_fields->botHolding ? SimPlan::Hold : SimPlan::Release,
+                        0, -1, checkSteps
+                    );
+                    if (currentPath.died && currentPath.survived < checkSteps) {
+                        this->cancelWaveTransition();
+                    } else {
+                        action = m_fields->botHolding ? BotAction::Hold : BotAction::Release;
+                    }
+                }
+            }
+
+            if (!tapForcedHold && !waveDidSwitch && (!scheduledWave || !m_fields->waveTransitionActive)) {
+                WavePlan selectedWavePlan;
+                action = decideAutoPress(
+                    rig, idleResult, botSteps, m_fields->botHolding,
+                    scheduledWave ? &selectedWavePlan : nullptr
+                );
+                if (scheduledWave && selectedWavePlan.switchCount > 0) {
+                    m_fields->waveTransitionActive = true;
+                    m_fields->waveStepsUntilTransition = selectedWavePlan.switchSteps[0];
+                    m_fields->waveTransitionTarget = !selectedWavePlan.startHolding;
+                }
+            }
 
             if (debugLogEnabled()) {
                 ++m_fields->logFrame;
@@ -997,12 +1263,14 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         } else {
             this->releaseBot();
             this->cancelTap();
+            this->cancelWaveTransition();
         }
     }
 
     void onQuit() {
         this->releaseBot();
         this->cancelTap();
+        this->cancelWaveTransition();
 
         m_fields->drawNode = nullptr;
         m_fields->dummy1 = nullptr;
@@ -1016,5 +1284,5 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 };
 
 $on_mod(Loaded) {
-    log::info("Auto Trajectory v0.4.0 loaded");
+    log::info("Auto Trajectory v0.5.0 loaded");
 }
