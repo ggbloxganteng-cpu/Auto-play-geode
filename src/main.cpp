@@ -305,33 +305,36 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 
     void scanLevel() {
         std::vector<at::ObjectRecord> records;
-        records.reserve(m_objects.size());
-        for (auto* object : m_objects) {
-            if (!object) continue;
-            at::ObjectClass category = at::ObjectClass::Other;
-            if (typeinfo_cast<RingObject*>(object)) {
-                category = at::ObjectClass::Orb;
-            } else {
-                switch (object->m_objectType) {
-                    case GameObjectType::Hazard:
-                    case GameObjectType::AnimatedHazard:
-                    case GameObjectType::CollisionObject:
-                    case GameObjectType::Slope:
-                        category = at::ObjectClass::Hazard;
-                        break;
-                    case GameObjectType::YellowJumpPad:
-                    case GameObjectType::PinkJumpPad:
-                    case GameObjectType::RedJumpPad:
-                    case GameObjectType::GravityPad:
-                    case GameObjectType::SpiderPad:
-                        category = at::ObjectClass::Pad;
-                        break;
-                    default:
-                        if (isPortalId(object->m_objectID)) category = at::ObjectClass::Portal;
-                        break;
+        records.reserve(m_objects ? m_objects->count() : 0);
+        if (m_objects) {
+            for (unsigned i = 0; i < m_objects->count(); ++i) {
+                auto* object = static_cast<GameObject*>(m_objects->objectAtIndex(i));
+                if (!object) continue;
+                at::ObjectClass category = at::ObjectClass::Other;
+                if (typeinfo_cast<RingObject*>(object)) {
+                    category = at::ObjectClass::Orb;
+                } else {
+                    switch (object->m_objectType) {
+                        case GameObjectType::Hazard:
+                        case GameObjectType::AnimatedHazard:
+                        case GameObjectType::CollisionObject:
+                        case GameObjectType::Slope:
+                            category = at::ObjectClass::Hazard;
+                            break;
+                        case GameObjectType::YellowJumpPad:
+                        case GameObjectType::PinkJumpPad:
+                        case GameObjectType::RedJumpPad:
+                        case GameObjectType::GravityPad:
+                        case GameObjectType::SpiderPad:
+                            category = at::ObjectClass::Pad;
+                            break;
+                        default:
+                            if (isPortalId(object->m_objectID)) category = at::ObjectClass::Portal;
+                            break;
+                    }
                 }
+                records.push_back({object->getPositionX(), object->m_objectID, category});
             }
-            records.push_back({object->getPositionX(), object->m_objectID, category});
         }
         m_fields->levelScan.build(std::move(records), m_player1 ? m_player1->getPositionX() : 0.f);
         m_fields->lastCheckpoint = -1;
@@ -587,7 +590,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             return;
         }
 
-        if (!m_fields->levelScan.valid() && !m_objects.empty()) {
+        if (!m_fields->levelScan.valid() && m_objects && m_objects->count() > 0) {
             this->scanLevel();
         }
         if (m_fields->levelScan.valid()) {
