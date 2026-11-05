@@ -18,10 +18,47 @@
 
 #include "core/LevelScan.hpp"
 #include "ui/FloatingPanelTouch.hpp"
+#include "core/performance/AdaptiveScheduler.hpp"
 
 using namespace geode::prelude;
 
 namespace {
+    using at::performance::AdaptiveScheduler;
+    using at::performance::Preset;
+    using at::performance::Settings;
+
+    AdaptiveScheduler* g_performanceScheduler = nullptr;
+
+    Preset performancePreset() {
+        const auto value = Mod::get()->getSettingValue<int64_t>("performance-preset");
+        switch (value) {
+            case 0: return Preset::UltraLow;
+            case 1: return Preset::Low;
+            case 2: return Preset::Balanced;
+            case 3: return Preset::High;
+            default: return Preset::Custom;
+        }
+    }
+
+    Settings performanceSettings() {
+        auto settings = Settings::forPreset(performancePreset());
+        settings.adaptiveBudget = Mod::get()->getSettingValue<bool>("adaptive-budget");
+        settings.deferScanDuringJump = Mod::get()->getSettingValue<bool>("jump-protection");
+        settings.diagnostics = Mod::get()->getSettingValue<bool>("performance-diagnostics");
+        settings.sanitize();
+        return settings;
+    }
+
+    const char* performancePresetName(Preset preset) {
+        switch (preset) {
+            case Preset::UltraLow: return "ULTRA LOW";
+            case Preset::Low: return "LOW";
+            case Preset::Balanced: return "BALANCED";
+            case Preset::High: return "HIGH";
+            default: return "CUSTOM";
+        }
+    }
+
     bool autoPlayEnabled() {
         return Mod::get()->getSettingValue<bool>("auto-play");
     }
@@ -77,6 +114,7 @@ class $modify(AutoTrajPlayerObject, PlayerObject) {
         // Jump counters belong to the real PlayLayer; do not increment them
         // while a predictive clone is being evaluated.
         if (g_simulating) return;
+        if (g_performanceScheduler) g_performanceScheduler->notifyJump();
         PlayerObject::incrementJumps();
     }
 
@@ -227,6 +265,10 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         cocos2d::CCLabelBMFont* autoLabel = nullptr;
         cocos2d::CCLabelBMFont* trajLabel = nullptr;
         cocos2d::CCLabelBMFont* waveLabel = nullptr;
+        cocos2d::CCLabelBMFont* performanceLabel = nullptr;
+        cocos2d::CCLabelBMFont* adaptiveLabel = nullptr;
+        cocos2d::CCLabelBMFont* metricsLabel = nullptr;
+        AdaptiveScheduler scheduler{performanceSettings()};
         at::LevelScan levelScan;
         int lastCheckpoint = -1;
         int lastScanPercent = -1;
@@ -248,6 +290,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         bool timedHoldRobotMode = false;
         bool loggedSetup = false;
         int logFrame = 0;
+        int performanceLogFrame = 0;
         int lastLoggedAction = -1;
         bool lastAuto = false;
         bool lastTraj = true;
@@ -258,6 +301,9 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
             return false;
         }
+
+        m_fields->scheduler.setSettings(performanceSettings());
+        g_performanceScheduler = &m_fields->scheduler;
 
         if (m_objectLayer) {
             auto* draw = cocos2d::CCDrawNode::create();
@@ -346,7 +392,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 
     void updatePanelLayout() {
         if (!m_fields->panel) return;
-        const float height = m_fields->panelCollapsed ? 34.f : 118.f;
+        const float height = m_fields->panelCollapsed ? 34.f : 156.f;
         m_fields->panel->setContentSize({190.f, height});
         if (m_fields->headerLabel) {
             m_fields->headerLabel->setPosition({95.f, height - 13.f});
@@ -356,14 +402,18 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         }
         if (m_fields->scanLabel) {
             m_fields->scanLabel->setVisible(!m_fields->panelCollapsed);
-            m_fields->scanLabel->setPosition({95.f, 88.f});
+            m_fields->scanLabel->setPosition({95.f, 126.f});
+        }
+        if (m_fields->metricsLabel) {
+            m_fields->metricsLabel->setVisible(!m_fields->panelCollapsed);
+            m_fields->metricsLabel->setPosition({95.f, 108.f});
         }
         if (m_fields->menu) m_fields->menu->setVisible(!m_fields->panelCollapsed);
     }
 
     void setupFloatingPanel() {
         auto panel = cocos2d::CCLayerColor::create(
-            cocos2d::ccColor4B{13, 18, 26, 224}, 190.f, 118.f
+            cocos2d::ccColor4B{13, 18, 26, 232}, 190.f, 156.f
         );
         if (!panel) return;
         panel->setAnchorPoint({0.f, 0.f});
@@ -374,15 +424,21 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 
         auto header = cocos2d::CCLabelBMFont::create("AUTO TRAJECTORY  [drag / hide]", "bigFont.fnt");
         header->setScale(0.38f);
-        header->setPosition({95.f, 105.f});
+        header->setPosition({95.f, 143.f});
         panel->addChild(header, 2);
         m_fields->headerLabel = header;
 
         auto scan = cocos2d::CCLabelBMFont::create("ROUTE SCAN: READY", "bigFont.fnt");
         scan->setScale(0.32f);
-        scan->setPosition({95.f, 88.f});
+        scan->setPosition({95.f, 126.f});
         panel->addChild(scan, 2);
         m_fields->scanLabel = scan;
+
+        auto metrics = cocos2d::CCLabelBMFont::create("PERF: LOW | BUDGET: 450us", "bigFont.fnt");
+        metrics->setScale(0.27f);
+        metrics->setPosition({95.f, 108.f});
+        panel->addChild(metrics, 2);
+        m_fields->metricsLabel = metrics;
 
         auto autoLabel = cocos2d::CCLabelBMFont::create("AUTO PLAY: OFF", "bigFont.fnt");
         autoLabel->setScale(0.45f);
@@ -399,9 +455,21 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         auto waveItem = cocos2d::CCMenuItemLabel::create(
             waveLabel, this, menu_selector(AutoTrajPlayLayer::onToggleWavePlanner)
         );
-        auto menu = cocos2d::CCMenu::create(autoItem, trajItem, waveItem, nullptr);
-        menu->alignItemsVerticallyWithPadding(2.f);
-        menu->setPosition({95.f, 44.f});
+        auto perfLabel = cocos2d::CCLabelBMFont::create("PERF PRESET: LOW  >", "bigFont.fnt");
+        perfLabel->setScale(0.43f);
+        auto perfItem = cocos2d::CCMenuItemLabel::create(
+            perfLabel, this, menu_selector(AutoTrajPlayLayer::onCyclePerformancePreset)
+        );
+        auto adaptiveLabel = cocos2d::CCLabelBMFont::create("ADAPTIVE BUDGET: ON", "bigFont.fnt");
+        adaptiveLabel->setScale(0.43f);
+        auto adaptiveItem = cocos2d::CCMenuItemLabel::create(
+            adaptiveLabel, this, menu_selector(AutoTrajPlayLayer::onToggleAdaptiveBudget)
+        );
+        auto menu = cocos2d::CCMenu::create(
+            autoItem, trajItem, waveItem, perfItem, adaptiveItem, nullptr
+        );
+        menu->alignItemsVerticallyWithPadding(1.f);
+        menu->setPosition({95.f, 53.f});
         menu->setScale(0.68f);
         menu->setID("autotraj-menu"_spr);
         panel->addChild(menu, 2);
@@ -410,12 +478,16 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->autoLabel = autoLabel;
         m_fields->trajLabel = trajLabel;
         m_fields->waveLabel = waveLabel;
+        m_fields->performanceLabel = perfLabel;
+        m_fields->adaptiveLabel = adaptiveLabel;
         m_fields->lastAuto = autoPlayEnabled();
         m_fields->lastTraj = trajectoryEnabled();
         m_fields->lastUi = uiEnabled();
         autoLabel->setString(m_fields->lastAuto ? "AUTO PLAY: ON" : "AUTO PLAY: OFF");
         trajLabel->setString(m_fields->lastTraj ? "TRAJECTORY: ON" : "TRAJECTORY: OFF");
         waveLabel->setString(waveRoomAwareEnabled() ? "WAVE PLAN: ON" : "WAVE PLAN: OFF");
+        perfLabel->setString(fmt::format("PERF PRESET: {}  >", performancePresetName(performancePreset())).c_str());
+        adaptiveLabel->setString(Mod::get()->getSettingValue<bool>("adaptive-budget") ? "ADAPTIVE BUDGET: ON" : "ADAPTIVE BUDGET: OFF");
         panel->setVisible(m_fields->lastUi);
         this->updatePanelLayout();
 
@@ -440,6 +512,27 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
     void onToggleTrajectory(CCObject*) {
         bool value = !trajectoryEnabled();
         Mod::get()->setSettingValue<bool>("show-trajectory", value);
+    }
+
+    void onCyclePerformancePreset(CCObject*) {
+        auto value = Mod::get()->getSettingValue<int64_t>("performance-preset");
+        value = (value + 1) % 4;
+        Mod::get()->setSettingValue<int64_t>("performance-preset", value);
+        m_fields->scheduler.setSettings(performanceSettings());
+        if (m_fields->performanceLabel) {
+            m_fields->performanceLabel->setString(
+                fmt::format("PERF PRESET: {}  >", performancePresetName(performancePreset())).c_str()
+            );
+        }
+    }
+
+    void onToggleAdaptiveBudget(CCObject*) {
+        const bool value = !Mod::get()->getSettingValue<bool>("adaptive-budget");
+        Mod::get()->setSettingValue<bool>("adaptive-budget", value);
+        m_fields->scheduler.setSettings(performanceSettings());
+        if (m_fields->adaptiveLabel) {
+            m_fields->adaptiveLabel->setString(value ? "ADAPTIVE BUDGET: ON" : "ADAPTIVE BUDGET: OFF");
+        }
     }
 
     void onToggleWavePlanner(CCObject*) {
@@ -525,6 +618,24 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
     void postUpdate(float dt) override {
         PlayLayer::postUpdate(dt);
 
+        m_fields->scheduler.setSettings(performanceSettings());
+        m_fields->scheduler.beginFrame(dt > 0.f ? dt * 1000.f : 0.f);
+        const auto perfMetrics = m_fields->scheduler.metrics();
+        if (perfMetrics.diagnostics && ++m_fields->performanceLogFrame % 120 == 0) {
+            log::info("[AT PERF] preset={} avgFrame={:.2f}ms budget={}us deferred={} adaptiveCuts={} emergencyYields={} jumpGrace={}",
+                performancePresetName(performancePreset()), perfMetrics.averageFrameMs,
+                perfMetrics.currentBudgetUs, perfMetrics.deferredSlices,
+                perfMetrics.adaptiveReductions, perfMetrics.emergencyYields,
+                perfMetrics.jumpGraceActive);
+        }
+        if (m_fields->metricsLabel && m_fields->scheduler.mayRun(AdaptiveScheduler::WorkClass::UI)) {
+            m_fields->metricsLabel->setString(fmt::format(
+                "{} | {:d}us | {:.1f}ms{}",
+                performancePresetName(performancePreset()), perfMetrics.currentBudgetUs,
+                perfMetrics.averageFrameMs, perfMetrics.jumpGraceActive ? " | JUMP SAFE" : ""
+            ).c_str());
+        }
+
         if (g_stepCounter > 0) {
             g_frameSubsteps = std::clamp(g_stepCounter, 1, 16);
         }
@@ -558,8 +669,11 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             m_fields->lastUi = uiOn;
         }
 
+        const bool drawDue = trajOn && m_fields->scheduler.mayRun(
+            AdaptiveScheduler::WorkClass::TrajectoryReplan
+        );
         if (m_fields->drawNode) {
-            m_fields->drawNode->clear();
+            if (drawDue) m_fields->drawNode->clear();
             m_fields->drawNode->setVisible(trajOn);
         }
 
@@ -618,6 +732,10 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             }
         }
 
+        // With Auto Play disabled, the overlay is the only reason to simulate.
+        // Skip the whole predictive pass on throttled frames and during jump grace.
+        if (!autoOn && !drawDue) return;
+
         float dtStep = g_stepDt;
         if (!(dtStep > 0.001f) || dtStep > 2.f) {
             dtStep = 0.25f;
@@ -625,8 +743,11 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 
         // The overlay length is purely visual. The bot has its own lookahead,
         // so changing one never changes how the other behaves.
-        int drawSteps = trajOn ? std::clamp(trajectorySteps(), 10, 400) : 0;
-        int botSteps = autoOn ? std::clamp(autoPlayLookahead(), 24, 480) : 0;
+        const int presetHorizon = performancePreset() == Preset::UltraLow ? 72 :
+            (performancePreset() == Preset::Low ? 120 :
+            (performancePreset() == Preset::Balanced ? 200 : 320));
+        int drawSteps = drawDue ? std::min(std::clamp(trajectorySteps(), 10, 400), presetHorizon) : 0;
+        int botSteps = autoOn ? std::min(std::clamp(autoPlayLookahead(), 24, 480), presetHorizon) : 0;
         int horizon = std::max(drawSteps, botSteps);
 
         if (horizon <= 0) {
@@ -644,7 +765,11 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         rig.source = m_player1;
         rig.dt = dtStep;
         rig.roomAwareWave = waveRoomAwareEnabled();
-        rig.deepWaveSearch = waveDeepSearchEnabled();
+        // Deep search is intentionally disabled on low-end presets and during
+        // the jump grace window to avoid candidate bursts near input events.
+        rig.deepWaveSearch = waveDeepSearchEnabled() &&
+            (performancePreset() == Preset::High || performancePreset() == Preset::Custom) &&
+            !perfMetrics.jumpGraceActive;
         if (m_gameState.m_isDualMode && m_player2 && m_fields->dummy2 && !m_player2->m_isDead) {
             rig.dummy2 = m_fields->dummy2;
             rig.source2 = m_player2;
@@ -876,6 +1001,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         this->cancelWaveTransition();
         this->cancelTimedHold();
 
+        if (g_performanceScheduler == &m_fields->scheduler) g_performanceScheduler = nullptr;
         m_fields->drawNode = nullptr;
         m_fields->panel = nullptr;
         m_fields->panelTouch = nullptr;
@@ -887,11 +1013,14 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->autoLabel = nullptr;
         m_fields->trajLabel = nullptr;
         m_fields->waveLabel = nullptr;
+        m_fields->performanceLabel = nullptr;
+        m_fields->adaptiveLabel = nullptr;
+        m_fields->metricsLabel = nullptr;
 
         PlayLayer::onQuit();
     }
 };
 
 $on_mod(Loaded) {
-    log::info("Auto Trajectory v0.6.0 loaded");
+    log::info("Auto Trajectory v0.7.0 loaded");
 }
