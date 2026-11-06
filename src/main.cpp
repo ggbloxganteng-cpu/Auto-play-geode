@@ -9,16 +9,19 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <initializer_list>
 #include <iterator>
 #include <utility>
 #include <unordered_set>
 #include <vector>
 #include <string>
+#include <string_view>
 
 #include "core/LevelScan.hpp"
 #include "ui/FloatingPanelTouch.hpp"
 #include "core/performance/AdaptiveScheduler.hpp"
+#include "core/performance/LevelStrategyProfile.hpp"
 
 using namespace geode::prelude;
 
@@ -28,6 +31,16 @@ namespace {
     using at::performance::Settings;
 
     AdaptiveScheduler* g_performanceScheduler = nullptr;
+
+    // 1=regular orb, 2=Spider Orb, 3=Dash Orb.
+    struct LiveInteractionEvidence {
+        int contactKind = 0;
+        int activationKind = 0;
+        float contactX = -100000.f;
+        float activationX = -100000.f;
+        void clear() noexcept { *this = LiveInteractionEvidence{}; }
+    };
+    LiveInteractionEvidence g_liveInteractionEvidence;
 
     Preset performancePreset() {
         const auto value = Mod::get()->getSettingValue<int64_t>("performance-preset");
@@ -126,13 +139,31 @@ class $modify(AutoTrajPlayerObject, PlayerObject) {
         if (g_simulating && !isSimDummy(this)) return;
         if (g_simulating) {
             snapshotSimObject(ring);
-            recordSimOrbActivation(ring, g_simCurrentStep);
+            if (isSpiderOrb(ring)) recordSimSpiderOrbActivation(ring, g_simCurrentStep);
+            else recordSimOrbActivation(ring, g_simCurrentStep);
+        } else if (ring) {
+            if (auto* pl = PlayLayer::get(); pl && pl->m_player1 == this) {
+                g_liveInteractionEvidence.activationKind = isSpiderOrb(ring) ? 2 : 1;
+                g_liveInteractionEvidence.activationX = getPositionX();
+            }
         }
         PlayerObject::ringJump(ring, unk);
     }
 
     void playSpiderDashEffect(cocos2d::CCPoint from, cocos2d::CCPoint to) {
-        if (g_simulating) return;
+        if (g_simulating) {
+            if (isSimDummy(this)) {
+                const int playerIndex = this == g_simDummies[1] ? 1 : 0;
+                auto* spiderOrb = g_simPendingSpiderOrb[playerIndex];
+                if (spiderOrb) recordSimSpiderOrbActivation(spiderOrb, g_simCurrentStep);
+                g_simPendingSpiderOrb[playerIndex] = nullptr;
+            }
+            return; // suppress only the clone's visual effect, not its activation evidence
+        }
+        if (auto* pl = PlayLayer::get(); pl && pl->m_player1 == this) {
+            g_liveInteractionEvidence.activationKind = 2;
+            g_liveInteractionEvidence.activationX = getPositionX();
+        }
         PlayerObject::playSpiderDashEffect(from, to);
     }
 };
@@ -198,6 +229,8 @@ class $modify(AutoTrajBaseLayer, GJBaseGameLayer) {
                 if (auto* ring = typeinfo_cast<RingObject*>(object)) {
                     if (playerRect.intersectsRect(object->getObjectRect())) {
                         recordSimOrbContact(ring, g_simCurrentStep);
+                        if (isSpiderOrb(ring))
+                            recordSimSpiderOrbContact(ring, g_simCurrentStep, player);
                     }
                 }
 
@@ -250,6 +283,18 @@ class $modify(AutoTrajBaseLayer, GJBaseGameLayer) {
                 player, &filtered, static_cast<int>(filtered.size()), dt
             );
             return;
+        } else if (!g_simulating && objects) {
+            if (auto* pl = PlayLayer::get(); pl && player == pl->m_player1) {
+                const auto playerRect = player->getObjectRect();
+                for (int i = 0; i < count; ++i) {
+                    auto* object = objects->at(i);
+                    auto* ring = typeinfo_cast<RingObject*>(object);
+                    if (!ring || !playerRect.intersectsRect(object->getObjectRect())) continue;
+                    g_liveInteractionEvidence.contactKind = isDashOrb(ring) ? 3 :
+                        (isSpiderOrb(ring) ? 2 : 1);
+                    g_liveInteractionEvidence.contactX = player->getPositionX();
+                }
+            }
         }
 
         GJBaseGameLayer::collisionCheckObjects(player, objects, count, dt);
@@ -306,6 +351,21 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         bool dashHoldScheduled = false;
         int dashHoldStepsRemaining = 0;
         int dashHoldDurationSteps = 0;
+        int timedHoldDashWaitStepsRemaining = 0;
+        // Per-level planning learner; separate from the device frame budget.
+        at::performance::LevelStrategyProfile levelStrategyProfile;
+        std::string levelStrategyKey;
+        Preset activeStrategyPreset = Preset::Low;
+        int bestAttemptProgress = 0;
+        bool deathLearningRecorded = false;
+        bool lastObservedDashActive = false;
+        bool lastPredictionSafe = false;
+        bool lastPredictionMismatch = false;
+        int lastDecisionAction = -1;
+        int lastDecisionSurvived = 0;
+        int lastDecisionHorizon = 0;
+        float lastDecisionX = 0.f;
+        float lastDecisionY = 0.f;
         bool loggedSetup = false;
         int logFrame = 0;
         int performanceLogFrame = 0;
@@ -321,6 +381,9 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         }
 
         m_fields->scheduler.setSettings(performanceSettings());
+        this->loadLevelStrategy(level);
+        g_liveInteractionEvidence.clear();
+        m_fields->lastObservedDashActive = false;
         g_performanceScheduler = &m_fields->scheduler;
 
         if (m_objectLayer) {
@@ -362,6 +425,9 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->timedHoldActive = false;
         m_fields->timedHoldStepsRemaining = 0;
         m_fields->timedHoldRobotMode = false;
+        m_fields->timedHoldDashMode = false;
+        m_fields->timedHoldDashStarted = false;
+        m_fields->timedHoldDashWaitStepsRemaining = 0;
         m_fields->loggedSetup = false;
         g_warnedStepZero = false;
 
@@ -421,11 +487,15 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         setStateLabel(m_fields->waveLabel, waveOn ? "WAVE ASSIST: ON" : "WAVE ASSIST: OFF", waveOn);
         setStateLabel(m_fields->adaptiveLabel, adaptiveOn ? "AUTO-SAVE FPS: ON" : "AUTO-SAVE FPS: OFF", adaptiveOn);
         if (m_fields->performanceLabel) {
-            m_fields->performanceLabel->setString(fmt::format("PERFORMANCE: {}  >", preset).c_str());
+            m_fields->performanceLabel->setString(fmt::format(
+                "DEVICE: {} | PLAN: {}  >", preset,
+                performancePresetName(m_fields->activeStrategyPreset)
+            ).c_str());
         }
         if (m_fields->statusLabel) {
             m_fields->statusLabel->setString(fmt::format(
-                "Auto {} | Path {} | {}", autoOn ? "ON" : "OFF", trajOn ? "ON" : "OFF", preset
+                "Auto {} | Path {} | Plan {}", autoOn ? "ON" : "OFF", trajOn ? "ON" : "OFF",
+                performancePresetName(m_fields->activeStrategyPreset)
             ).c_str());
         }
     }
@@ -532,7 +602,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         auto waveItem = cocos2d::CCMenuItemLabel::create(
             waveLabel, this, menu_selector(AutoTrajPlayLayer::onToggleWavePlanner)
         );
-        auto perfLabel = cocos2d::CCLabelBMFont::create("PERF PRESET: LOW  >", "bigFont.fnt");
+        auto perfLabel = cocos2d::CCLabelBMFont::create("DEVICE: LOW | PLAN: LOW  >", "bigFont.fnt");
         perfLabel->setScale(0.43f);
         auto perfItem = cocos2d::CCMenuItemLabel::create(
             perfLabel, this, menu_selector(AutoTrajPlayLayer::onCyclePerformancePreset)
@@ -650,6 +720,145 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->timedHoldRobotMode = false;
         m_fields->timedHoldDashMode = false;
         m_fields->timedHoldDashStarted = false;
+        m_fields->timedHoldDashWaitStepsRemaining = 0;
+    }
+
+    static std::string makeLevelStrategyKey(GJGameLevel* level) {
+        if (!level) return "level-unknown";
+        if (level->m_levelID != 0) return fmt::format("level-{}", level->m_levelID);
+        // Local/editor levels can have ID 0. A stable FNV-1a hash of the name
+        // keeps their profile separate without storing level contents.
+        const char* name = level->m_levelName.c_str();
+        std::uint64_t hash = 1469598103934665603ull;
+        if (name) {
+            for (auto p = reinterpret_cast<unsigned char const*>(name); *p; ++p) {
+                hash ^= *p;
+                hash *= 1099511628211ull;
+            }
+        }
+        return fmt::format("level-local-{:016x}", hash);
+    }
+
+    Preset levelStrategyFallback() const {
+        const auto value = Mod::get()->getSettingValue<int64_t>("level-strategy-default");
+        return at::performance::strategyPresetFromIndex(static_cast<int>(value));
+    }
+
+    void loadLevelStrategy(GJGameLevel* level) {
+        m_fields->levelStrategyKey = makeLevelStrategyKey(level);
+        for (int i = 0; i < static_cast<int>(at::performance::kStrategyPresetCount); ++i) {
+            auto key = fmt::format("{}-{}", m_fields->levelStrategyKey, i);
+            m_fields->levelStrategyProfile.load(
+                i, Mod::get()->getSavedValue<int64_t>(key, 0)
+            );
+        }
+        const bool adaptive = Mod::get()->getSettingValue<bool>("level-adaptive-strategy");
+        m_fields->activeStrategyPreset = adaptive
+            ? m_fields->levelStrategyProfile.chooseNext(levelStrategyFallback())
+            : levelStrategyFallback();
+        m_fields->bestAttemptProgress = 0;
+        m_fields->deathLearningRecorded = false;
+        log::info("[AT LEARN] level={} initial-strategy={} adaptive={}",
+            m_fields->levelStrategyKey, performancePresetName(m_fields->activeStrategyPreset), adaptive);
+    }
+
+    void saveLevelStrategy() {
+        for (int i = 0; i < static_cast<int>(at::performance::kStrategyPresetCount); ++i) {
+            auto key = fmt::format("{}-{}", m_fields->levelStrategyKey, i);
+            Mod::get()->setSavedValue<int64_t>(key, m_fields->levelStrategyProfile.save(i));
+        }
+    }
+
+    void selectNextLevelStrategy() {
+        const bool adaptive = Mod::get()->getSettingValue<bool>("level-adaptive-strategy");
+        m_fields->activeStrategyPreset = adaptive
+            ? m_fields->levelStrategyProfile.chooseNext(levelStrategyFallback())
+            : levelStrategyFallback();
+        log::info("[AT LEARN] next-attempt strategy={}",
+            performancePresetName(m_fields->activeStrategyPreset));
+        this->refreshPanelLabels();
+    }
+
+    void recordDeathLearning(GameObject* deathObject = nullptr) {
+        if (m_fields->deathLearningRecorded || !m_player1 || !m_player1->m_isDead ||
+            !autoPlayEnabled() || m_fields->levelStrategyKey.empty()) return;
+
+        int progress = m_fields->bestAttemptProgress;
+        if (m_fields->levelScan.valid()) {
+            progress = std::max(progress,
+                m_fields->levelScan.progressPercent(m_player1->getPositionX()));
+        }
+        const float deathX = m_player1->getPositionX();
+        const bool recentContact = g_liveInteractionEvidence.contactKind != 0 &&
+            deathX >= g_liveInteractionEvidence.contactX - 20.f &&
+            deathX - g_liveInteractionEvidence.contactX <= 180.f;
+        const bool activatedAfterContact = g_liveInteractionEvidence.activationKind ==
+                g_liveInteractionEvidence.contactKind &&
+            g_liveInteractionEvidence.activationX >= g_liveInteractionEvidence.contactX - 20.f &&
+            g_liveInteractionEvidence.activationX <= deathX + 20.f;
+        const bool missedInteraction = recentContact && !activatedAfterContact &&
+            (g_liveInteractionEvidence.contactKind == 2 || g_liveInteractionEvidence.contactKind == 3 ||
+             g_liveInteractionEvidence.contactKind == 1);
+        const bool mismatch = m_fields->lastPredictionSafe;
+        const auto preset = m_fields->activeStrategyPreset;
+        m_fields->levelStrategyProfile.record(preset, progress, mismatch);
+        this->saveLevelStrategy();
+        m_fields->deathLearningRecorded = true;
+
+        const char* diagnosis = "UNCLASSIFIED_DEATH";
+        const char* recommendation = "Keep debug log enabled; compare the next attempt at the same section.";
+        if (missedInteraction) {
+            switch (g_liveInteractionEvidence.contactKind) {
+                case 2:
+                    diagnosis = "SPIDER_ORB_NOT_CONFIRMED";
+                    recommendation = "Re-sync the spider teleport event; verify the target-side collision before planning the next jump.";
+                    break;
+                case 3:
+                    diagnosis = "DASH_ORB_NOT_CONFIRMED";
+                    recommendation = "Hold until m_isDashing is confirmed; start the duration timer only after activation.";
+                    break;
+                default:
+                    diagnosis = "ORB_NOT_CONFIRMED";
+                    recommendation = "Re-test a frame-aligned tap window and require a confirmed activation, not overlap alone.";
+                    break;
+            }
+        } else if (deathObject) {
+            const auto type = deathObject->m_objectType;
+            diagnosis = (type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard)
+                ? "HAZARD_COLLISION" : "OBJECT_COLLISION";
+            recommendation = "Use the logged collision object ID/type/position to inspect its hitbox and nearby triggers; compare the next strategy at this exact section.";
+        } else if (mismatch) {
+            diagnosis = "LIVE_SIM_DIVERGENCE_CANDIDATE";
+            recommendation = "The last no-input forecast looked safe but the live attempt died; inspect the collision object, moving triggers and input timing before changing the profile.";
+        } else if (m_fields->lastDecisionSurvived < m_fields->lastDecisionHorizon) {
+            diagnosis = "NO_SAFE_ROUTE_FOUND";
+            recommendation = "Try the next strategy profile with a wider lookahead and compare the furthest progress.";
+        }
+        int causeCode = 0;
+        if (std::string_view(diagnosis) == "SPIDER_ORB_NOT_CONFIRMED") causeCode = 1;
+        else if (std::string_view(diagnosis) == "DASH_ORB_NOT_CONFIRMED") causeCode = 2;
+        else if (std::string_view(diagnosis) == "ORB_NOT_CONFIRMED") causeCode = 3;
+        else if (std::string_view(diagnosis) == "HAZARD_COLLISION") causeCode = 4;
+        else if (std::string_view(diagnosis) == "OBJECT_COLLISION") causeCode = 5;
+        else if (std::string_view(diagnosis) == "LIVE_SIM_DIVERGENCE_CANDIDATE") causeCode = 6;
+        else if (std::string_view(diagnosis) == "NO_SAFE_ROUTE_FOUND") causeCode = 7;
+        auto causeKey = fmt::format("{}-death-cause-{}", m_fields->levelStrategyKey, causeCode);
+        const auto previousCauseCount = Mod::get()->getSavedValue<int64_t>(causeKey, 0);
+        const auto causeCount = std::min<int64_t>(999999, previousCauseCount + 1);
+        Mod::get()->setSavedValue<int64_t>(causeKey, causeCount);
+
+        const int deathObjectId = deathObject ? deathObject->m_objectID : -1;
+        const int deathObjectType = deathObject ? static_cast<int>(deathObject->m_objectType) : -1;
+        const float deathObjectX = deathObject ? deathObject->getPositionX() : -1.f;
+        const float deathObjectY = deathObject ? deathObject->getPositionY() : -1.f;
+        log::warn("[AT LEARN] death level={} progress={} strategy={} diagnosis={} action={} predicted={}/{} lastXY=({:.1f},{:.1f}) objectId={} objectType={} objectXY=({:.1f},{:.1f}) sameCauseCount={} contactKind={} contactX={:.1f} activationKind={} activationX={:.1f} advice=\"{}\"",
+            m_fields->levelStrategyKey, progress, performancePresetName(preset), diagnosis,
+            m_fields->lastDecisionAction, m_fields->lastDecisionSurvived,
+            m_fields->lastDecisionHorizon, m_fields->lastDecisionX, m_fields->lastDecisionY,
+            deathObjectId, deathObjectType, deathObjectX, deathObjectY, causeCount,
+            g_liveInteractionEvidence.contactKind, g_liveInteractionEvidence.contactX,
+            g_liveInteractionEvidence.activationKind, g_liveInteractionEvidence.activationX,
+            recommendation);
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) override {
@@ -660,6 +869,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 
         PlayLayer::destroyPlayer(player, object);
         if (player == m_player1) {
+            this->recordDeathLearning(object);
             m_fields->botHolding = false;
             this->cancelTap();
             this->cancelOrbTapSchedule();
@@ -670,6 +880,13 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 
     void resetLevel() override {
         PlayLayer::resetLevel();
+        if (m_fields->deathLearningRecorded) this->selectNextLevelStrategy();
+        m_fields->deathLearningRecorded = false;
+        m_fields->bestAttemptProgress = 0;
+        m_fields->lastObservedDashActive = false;
+        g_liveInteractionEvidence.clear();
+        m_fields->lastPredictionSafe = false;
+        m_fields->lastPredictionMismatch = false;
         m_fields->botHolding = false;
         this->cancelTap();
         this->cancelOrbTapSchedule();
@@ -689,14 +906,28 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 
     void postUpdate(float dt) override {
         PlayLayer::postUpdate(dt);
+        if (m_player1) {
+            if (m_player1->m_isDashing && !m_fields->lastObservedDashActive) {
+                g_liveInteractionEvidence.activationKind = 3;
+                g_liveInteractionEvidence.activationX = m_player1->getPositionX();
+            }
+            m_fields->lastObservedDashActive = m_player1->m_isDashing;
+        }
+        this->recordDeathLearning();
+        if (m_player1 && !m_player1->m_isDead && m_fields->levelScan.valid()) {
+            m_fields->bestAttemptProgress = std::max(
+                m_fields->bestAttemptProgress,
+                m_fields->levelScan.progressPercent(m_player1->getPositionX())
+            );
+        }
 
         m_fields->scheduler.setSettings(performanceSettings());
         m_fields->scheduler.beginFrame(dt > 0.f ? dt * 1000.f : 0.f);
         const auto perfMetrics = m_fields->scheduler.metrics();
         if (Mod::get()->getSettingValue<bool>("performance-diagnostics") &&
             ++m_fields->performanceLogFrame % 120 == 0) {
-            log::info("[AT PERF] preset={} avgFrame={:.2f}ms budget={}us deferred={} adaptiveCuts={} emergencyYields={} jumpGrace={}",
-                performancePresetName(performancePreset()), perfMetrics.averageFrameMs,
+            log::info("[AT PERF] deviceBudget={} levelStrategy={} avgFrame={:.2f}ms budget={}us deferred={} adaptiveCuts={} emergencyYields={} jumpGrace={}",
+                performancePresetName(performancePreset()), performancePresetName(m_fields->activeStrategyPreset), perfMetrics.averageFrameMs,
                 perfMetrics.currentBudgetUs, perfMetrics.deferredSlices,
                 perfMetrics.adaptiveReductions, perfMetrics.emergencyYields,
                 perfMetrics.jumpGraceActive);
@@ -812,9 +1043,12 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 
         // The overlay length is purely visual. The bot has its own lookahead,
         // so changing one never changes how the other behaves.
-        const int presetHorizon = performancePreset() == Preset::UltraLow ? 72 :
-            (performancePreset() == Preset::Low ? 120 :
-            (performancePreset() == Preset::Balanced ? 200 : 320));
+        // Planning depth is a level-specific strategy choice. Device Budget is
+        // deliberately handled by AdaptiveScheduler and must not overwrite the
+        // profile that the learner discovered for this level.
+        const int presetHorizon = m_fields->activeStrategyPreset == Preset::UltraLow ? 72 :
+            (m_fields->activeStrategyPreset == Preset::Low ? 120 :
+            (m_fields->activeStrategyPreset == Preset::Balanced ? 200 : 320));
         int drawSteps = drawDue ? std::min(std::clamp(trajectorySteps(), 10, 400), presetHorizon) : 0;
         int botSteps = autoOn ? std::min(std::clamp(autoPlayLookahead(), 24, 480), presetHorizon) : 0;
         int horizon = std::max(drawSteps, botSteps);
@@ -837,7 +1071,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         // Deep search is intentionally disabled on low-end presets and during
         // the jump grace window to avoid candidate bursts near input events.
         rig.deepWaveSearch = waveDeepSearchEnabled() &&
-            (performancePreset() == Preset::High || performancePreset() == Preset::Custom) &&
+            (m_fields->activeStrategyPreset == Preset::High) &&
             !perfMetrics.jumpGraceActive;
         if (m_gameState.m_isDualMode && m_player2 && m_fields->dummy2 && !m_player2->m_isDead) {
             rig.dummy2 = m_fields->dummy2;
@@ -848,22 +1082,36 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         bool timedHoldJustReleased = false;
         if (m_fields->timedHoldActive) {
             const bool modeChanged = m_fields->timedHoldRobotMode && !m_player1->m_isRobot;
-            if (m_fields->timedHoldDashMode && m_player1->m_isDashing) {
-                m_fields->timedHoldDashStarted = true;
-            }
+            const bool dashBecameActive = m_fields->timedHoldDashMode &&
+                !m_fields->timedHoldDashStarted && m_player1->m_isDashing;
+            if (dashBecameActive) m_fields->timedHoldDashStarted = true;
             const bool dashEnded = m_fields->timedHoldDashMode &&
                 m_fields->timedHoldDashStarted && !m_player1->m_isDashing;
             if (modeChanged || dashEnded) {
                 this->cancelTimedHold();
                 this->releaseBot();
                 timedHoldJustReleased = true;
+            } else if (m_fields->timedHoldDashMode && !m_fields->timedHoldDashStarted) {
+                // Do not burn the dash duration while waiting for contact. A short
+                // watchdog prevents a missed orb from leaving Jump held forever.
+                m_fields->timedHoldDashWaitStepsRemaining -= std::max(1, g_frameSubsteps);
+                if (m_fields->timedHoldDashWaitStepsRemaining <= 0) {
+                    this->cancelTimedHold();
+                    this->releaseBot();
+                    timedHoldJustReleased = true;
+                } else {
+                    timedHoldForced = true;
+                }
+            } else if (dashBecameActive) {
+                // Activation has just been observed. Start counting on the next
+                // game update so the requested active-dash duration is not shortened.
+                timedHoldForced = true;
             } else {
                 m_fields->timedHoldStepsRemaining -= std::max(1, g_frameSubsteps);
                 if (m_fields->timedHoldStepsRemaining <= 0) {
                     this->releaseBot();
                     this->cancelTimedHold();
-                    // Re-plan in this same postUpdate. For Dash Orbs this release
-                    // ends the dash; Robot keeps its finite jump pulse behavior.
+                    timedHoldJustReleased = true;
                 } else {
                     timedHoldForced = true;
                 }
@@ -1021,6 +1269,14 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                 }
             }
 
+            m_fields->lastDecisionAction = static_cast<int>(action);
+            m_fields->lastDecisionSurvived = idleResult.survived;
+            m_fields->lastDecisionHorizon = botSteps;
+            m_fields->lastDecisionX = m_player1->getPositionX();
+            m_fields->lastDecisionY = m_player1->getPositionY();
+            m_fields->lastPredictionSafe = !idleResult.died || idleResult.survived >= botSteps;
+            m_fields->lastPredictionMismatch = false;
+
             if (debugLogEnabled()) {
                 ++m_fields->logFrame;
                 const bool hazard = idleResult.died && idleResult.survived < botSteps;
@@ -1029,7 +1285,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                     m_fields->lastLoggedAction = static_cast<int>(action);
                     log::info(
                         "[AT] f={} x={:.0f} y={:.0f} gnd={} up={} mode={} dual={} "
-                        "idle(died={} surv={} orbContact={} orbFirst={} orbActivated={} dashContact={} dashFirst={} dashActive={} dashActivated={}) "
+                        "idle(died={} surv={} orbContact={} orbFirst={} orbActivated={} spiderContact={} spiderActivated={} dashContact={} dashFirst={} dashActive={} dashActivated={}) "
                         "tapPulse={} tapLeft={} orbPlanDelay={} orbDelayLeft={} holdLeft={} action={}",
                         m_fields->logFrame, m_player1->getPositionX(), m_player1->getPositionY(),
                         m_player1->m_isOnGround, m_player1->m_isUpsideDown,
@@ -1039,7 +1295,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                             (m_player1->m_isSpider ? "spider" : "cube")))))),
                         rig.dummy2 != nullptr, idleResult.died, idleResult.survived,
                         idleResult.orbContacts, idleResult.firstOrbContactStep,
-                        idleResult.orbActivations, idleResult.dashContacts,
+                        idleResult.orbActivations, idleResult.spiderOrbContacts,
+                        idleResult.spiderOrbActivations, idleResult.dashContacts,
                         idleResult.firstDashContactStep, idleResult.dashActiveAtEnd,
                         idleResult.dashActivations, m_fields->botTapActive,
                         m_fields->botTapStepsRemaining, selectedOrbTapDelaySteps,
@@ -1074,7 +1331,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                     this->cancelOrbTapSchedule();
                     this->cancelTimedHold();
                     this->cancelWaveTransition();
-                    if (requiresFreshPressEdge(action, m_fields->botHolding)) this->releaseBot();
+                    if (!m_player1->m_isDashing && requiresFreshPressEdge(action, m_fields->botHolding))
+                        this->releaseBot();
                     this->pressBot();
                     m_fields->timedHoldActive = true;
                     m_fields->timedHoldStepsRemaining = std::max(
@@ -1083,6 +1341,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                     m_fields->timedHoldRobotMode = false;
                     m_fields->timedHoldDashMode = true;
                     m_fields->timedHoldDashStarted = m_player1->m_isDashing;
+                    m_fields->timedHoldDashWaitStepsRemaining = std::max(32, 8 * std::max(1, g_frameSubsteps));
                     break;
                 case BotAction::DelayedDashHold:
                     this->cancelTap();
