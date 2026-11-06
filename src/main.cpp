@@ -71,6 +71,10 @@ namespace {
         return Mod::get()->getSettingValue<bool>("show-ui");
     }
 
+    bool straightFlyEnabled() {
+        return Mod::get()->getSettingValue<bool>("straight-fly");
+    }
+
     bool waveRoomAwareEnabled() {
         return Mod::get()->getSettingValue<bool>("wave-room-aware");
     }
@@ -286,6 +290,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         cocos2d::CCPoint panelTouchStart = {0.f, 0.f};
         cocos2d::CCPoint panelPositionStart = {0.f, 0.f};
         bool botHolding = false;
+        HoverState hover;
         bool waveTransitionActive = false;
         int waveStepsUntilTransition = 0;
         bool waveTransitionTarget = false;
@@ -343,6 +348,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
 
         this->scanLevel();
         this->setupFloatingPanel();
+        m_fields->hover = HoverState{};
         m_fields->botHolding = false;
         m_fields->botTapActive = false;
         m_fields->botTapStepsRemaining = 0;
@@ -915,6 +921,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             }
             int selectedTimedHoldSteps = 0;
             int selectedOrbTapDelaySteps = 0;
+            if (orbTapForced || timedHoldForced) m_fields->hover.active = false;
             if (orbTapForced) {
                 action = orbTapForcedAction;
             } else if (timedHoldForced) {
@@ -951,7 +958,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                     rig, idleResult, botSteps, m_fields->botHolding,
                     scheduledWave ? &selectedWavePlan : nullptr,
                     &selectedTimedHoldSteps,
-                    &selectedOrbTapDelaySteps
+                    &selectedOrbTapDelaySteps,
+                    straightFlyEnabled() ? &m_fields->hover : nullptr
                 );
                 if (scheduledWave && selectedWavePlan.switchCount > 0) {
                     m_fields->waveTransitionActive = true;
