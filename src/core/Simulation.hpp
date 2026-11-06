@@ -50,6 +50,13 @@ namespace {
     int g_simFirstDashContactStep = -1;
     int g_simDashActivationCount = 0;
     int g_simFirstDashActivationStep = -1;
+    int g_simSpiderOrbContactCount = 0;
+    int g_simFirstSpiderOrbContactStep = -1;
+    int g_simSpiderOrbActivationCount = 0;
+    int g_simFirstSpiderOrbActivationStep = -1;
+    RingObject* g_simPendingSpiderOrb[2] = {nullptr, nullptr};
+    std::unordered_set<RingObject*> g_simRecordedSpiderOrbContacts;
+    std::unordered_set<RingObject*> g_simRecordedSpiderOrbActivations;
     std::unordered_set<RingObject*> g_simRecordedOrbContacts;
     std::unordered_set<RingObject*> g_simRecordedOrbActivations;
     std::unordered_set<RingObject*> g_simRecordedDashContacts;
@@ -96,6 +103,13 @@ namespace {
     // Geometry Dash 2.2081: green Dash Orb = 1704, pink Gravity Dash Orb = 1751.
     // Runtime types are preferred; IDs also cover levels where object type is
     // rewritten by compatibility mods such as No-Touch.
+    bool isSpiderOrb(GameObject* object) {
+        // Spider Orb is editor object ID 3004 in GD 2.2. Check both the
+        // runtime type and ID because compatibility mods can rewrite m_objectType.
+        return object && (object->m_objectType == GameObjectType::SpiderOrb ||
+                          object->m_objectID == 3004);
+    }
+
     bool isDashOrb(GameObject* object) {
         if (!object) return false;
         return object->m_objectType == GameObjectType::DashRing ||
@@ -220,6 +234,14 @@ namespace {
         g_simFirstDashContactStep = -1;
         g_simDashActivationCount = 0;
         g_simFirstDashActivationStep = -1;
+        g_simSpiderOrbContactCount = 0;
+        g_simFirstSpiderOrbContactStep = -1;
+        g_simSpiderOrbActivationCount = 0;
+        g_simFirstSpiderOrbActivationStep = -1;
+        g_simPendingSpiderOrb[0] = nullptr;
+        g_simPendingSpiderOrb[1] = nullptr;
+        g_simRecordedSpiderOrbContacts.clear();
+        g_simRecordedSpiderOrbActivations.clear();
         g_simRecordedOrbContacts.clear();
         g_simRecordedOrbActivations.clear();
         g_simRecordedDashContacts.clear();
@@ -250,6 +272,15 @@ namespace {
         }
     }
 
+    void recordSimSpiderOrbContact(RingObject* ring, int step, PlayerObject* player) {
+        if (!ring) return;
+        if (g_simRecordedSpiderOrbContacts.insert(ring).second) ++g_simSpiderOrbContactCount;
+        if (g_simFirstSpiderOrbContactStep < 0 || step < g_simFirstSpiderOrbContactStep)
+            g_simFirstSpiderOrbContactStep = step;
+        const int playerIndex = player == g_simDummies[1] ? 1 : 0;
+        g_simPendingSpiderOrb[playerIndex] = ring;
+    }
+
     void recordSimDashActivation(int step) {
         ++g_simDashActivationCount;
         if (g_simFirstDashActivationStep < 0 || step < g_simFirstDashActivationStep) {
@@ -263,6 +294,18 @@ namespace {
         if (g_simFirstOrbActivationStep < 0 || step < g_simFirstOrbActivationStep) {
             g_simFirstOrbActivationStep = step;
         }
+    }
+
+    void recordSimSpiderOrbActivation(RingObject* ring, int step) {
+        if (!ring) return;
+        if (g_simRecordedSpiderOrbActivations.insert(ring).second) {
+            ++g_simSpiderOrbActivationCount;
+            if (g_simFirstSpiderOrbActivationStep < 0 || step < g_simFirstSpiderOrbActivationStep)
+                g_simFirstSpiderOrbActivationStep = step;
+        }
+        // Spider Orb may use its own spider-dash path instead of ringJump.
+        // Feed the common planner's activation signal, with the same dedup set.
+        recordSimOrbActivation(ring, step);
     }
 
     bool isSimInteractable(GameObject* object) {
@@ -319,6 +362,10 @@ struct SimResult {
     int firstDashContactStep = -1;
     int dashActivations = 0;
     int firstDashActivationStep = -1;
+    int spiderOrbContacts = 0;
+    int firstSpiderOrbContactStep = -1;
+    int spiderOrbActivations = 0;
+    int firstSpiderOrbActivationStep = -1;
     bool dashActiveAtEnd = false;
     // Sum of |y - hoverTargetY| over the first hoverSteps substeps (straight-fly metric).
     float hoverError = 0.f;
@@ -578,6 +625,10 @@ SimResult runSimulation(
     result.firstDashContactStep = g_simFirstDashContactStep;
     result.dashActivations = g_simDashActivationCount;
     result.firstDashActivationStep = g_simFirstDashActivationStep;
+    result.spiderOrbContacts = g_simSpiderOrbContactCount;
+    result.firstSpiderOrbContactStep = g_simFirstSpiderOrbContactStep;
+    result.spiderOrbActivations = g_simSpiderOrbActivationCount;
+    result.firstSpiderOrbActivationStep = g_simFirstSpiderOrbActivationStep;
     result.dashActiveAtEnd = d1->m_isDashing || (d2 && d2->m_isDashing);
 
     releaseAll();
@@ -977,6 +1028,8 @@ static OrbTapPlan findOrbTapPlan(SimRig const& rig, SimResult const& idle, int b
 struct DashHoldPlan {
     bool found = false;
     int delaySteps = 0;
+    // Duration after m_isDashing becomes true. Pre-contact wait is never counted
+    // here; the live controller starts this timer only after confirmed activation.
     int holdSteps = -1; // -1 means keep holding and re-plan from the next live frame
     int survived = 0;
     int activations = 0;
@@ -1007,19 +1060,19 @@ static DashHoldPlan findDashOrbHoldPlan(
     );
     const int afterContactFrames[] = {1, 2, 4, 8, 12, 24};
 
-    auto consider = [&](int delay, int holdSteps) {
-        SimResult result = probe(rig, SimPlan::Hold, delay, holdSteps, probeSteps);
+    auto consider = [&](int delay, int simulatedTotalHold, int holdAfterActivation) {
+        SimResult result = probe(rig, SimPlan::Hold, delay, simulatedTotalHold, probeSteps);
         if (result.dashActivations <= 0) return;
         if (result.died && result.survived <= idle.survived + kDoomedMargin) return;
         const int previousAfter = best.holdSteps < 0 ? 0 : best.holdSteps;
-        const int candidateAfter = holdSteps < 0 ? 0 : holdSteps;
+        const int candidateAfter = holdAfterActivation < 0 ? 0 : holdAfterActivation;
         const bool better = !best.found || result.survived > best.survived ||
             (result.survived == best.survived && candidateAfter < previousAfter) ||
             (result.survived == best.survived && candidateAfter == previousAfter && delay > best.delaySteps);
         if (better) {
             best.found = true;
             best.delaySteps = delay;
-            best.holdSteps = holdSteps;
+            best.holdSteps = holdAfterActivation;
             best.survived = result.survived;
             best.activations = result.dashActivations;
         }
@@ -1028,11 +1081,12 @@ static DashHoldPlan findDashOrbHoldPlan(
     for (int delay = firstDelay; delay <= lastDelay; delay += frameSteps) {
         const int beforeContact = std::max(0, contact - delay);
         for (int afterFrames : afterContactFrames) {
-            consider(delay, beforeContact + afterFrames * frameSteps);
+            const int activeDuration = afterFrames * frameSteps;
+            consider(delay, beforeContact + activeDuration, activeDuration);
         }
         // Also test a continuing hold; the live planner will re-evaluate it
         // on subsequent frames and release when the predicted path requires it.
-        consider(delay, -1);
+        consider(delay, -1, -1);
     }
     return best;
 }
