@@ -8,9 +8,9 @@
 	},
 	"id": "yourname.auto-trajectory",
 	"name": "Auto Trajectory",
-	"version": "v0.7.0-beta.1",
+	"version": "v0.8.0-beta.1",
 	"developer": "yourname",
-	"description": "Dash Orb hold planning, Wave Planner 2.0 and bounded route-planning primitives.",
+	"description": "Dash/Spider Orb planning, per-level strategy learning, death diagnostics and Wave Planner.",
 	"links": {
 		"source": "https://github.com/yourname/auto-trajectory"
 	},
@@ -83,14 +83,33 @@
 			"description": "Shows a draggable, collapsible in-game panel for Auto Play, Trajectory, Wave Planner and route scan status.",
 			"default": true
 		},
+		"level-learning-title": {
+			"type": "title",
+			"name": "Level Learning"
+		},
+		"level-adaptive-strategy": {
+			"type": "bool",
+			"name": "Learn Strategy Per Level",
+			"description": "After Auto Play deaths, compare Ultra Low, Low, Balanced and High planning profiles for this level. The selected profile is saved per level and does not change the device frame-time budget. Learning is based on progress and prediction diagnostics, not guaranteed cause detection.",
+			"default": true
+		},
+		"level-strategy-default": {
+			"type": "int",
+			"name": "First Level Strategy",
+			"description": "Strategy used first for an unlearned level, then used as the fallback when per-level learning is disabled. 0=Ultra Low, 1=Low, 2=Balanced, 3=High.",
+			"default": 1,
+			"min": 0,
+			"max": 3,
+			"control": { "slider": false, "arrows": true, "arrow-step": 1 }
+		},
 		"performance-title": {
 			"type": "title",
 			"name": "Performance"
 		},
 		"performance-preset": {
 			"type": "int",
-			"name": "Performance Preset",
-			"description": "Ultra Low, Low, Balanced or High. Lower presets cap predictive lookahead to reduce frame spikes.",
+			"name": "Device Budget",
+			"description": "Controls the extra CPU-time budget for the device. Per-level planning depth is learned separately.",
 			"default": 1,
 			"min": 0,
 			"max": 3,

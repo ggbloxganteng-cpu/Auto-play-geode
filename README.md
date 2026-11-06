@@ -1,6 +1,15 @@
 # Auto Trajectory
 
-Geode mod for Geometry Dash **2.2081** (Geode **v5.11.2**) — **v0.7.0-beta.1**.
+Geode mod for Geometry Dash **2.2081** (Geode **v5.11.2**) — **v0.8.0-beta.1**.
+
+## v0.8.0-beta.1 — per-level learning and interaction fixes
+
+- **Dash Orb hold timing** — the hold-duration clock now starts only after the hidden/live player is confirmed in `m_isDashing`; a short activation watchdog prevents an indefinite hold when the orb did not activate. The timer is no longer consumed while waiting for the Dash Orb to start.
+- **Spider Orb interaction path** — Spider Orb (object ID `3004`) is tracked separately from normal jump orbs. The simulator records its contact window and confirms activation through the Spider-specific dash/teleport effect path (or the normal ring activation hook when the game uses it). The actual destination and collision result still depend on the game's live spider physics; offline tests cannot prove full runtime parity.
+- **Per-level strategy profile** — each level independently samples Ultra Low, Low, Balanced and High planning depth, records progress and prediction misses, then prefers the profile that has performed best on that level. Profiles are persisted by level ID/name.
+- **Device Budget stays separate** — Device Budget and Adaptive Budget continue to control background workload/frame-time behavior. The level learner controls planning horizon; a level's best strategy is not inferred from device capability.
+- **Death learning** — after an Auto Play death, the mod stores progress, selected profile, last prediction snapshot and nearby interaction evidence. Logs classify likely missed orb/Spider Orb/Dash Orb, prediction mismatch, or no safe route, with a suggested next diagnostic step. This is evidence-based heuristic feedback, not guaranteed identification of every physics cause.
+- **Tests** — added portable tests for Spider Orb evidence and per-level profile persistence/selection.
 
 ## v0.7.0-beta.1 — Dash Orb support
 
@@ -8,6 +17,7 @@ Geode mod for Geometry Dash **2.2081** (Geode **v5.11.2**) — **v0.7.0-beta.1**
 - **Real activation confirmation** — a Dash Orb candidate is accepted only when the simulated player enters the game's `m_isDashing` state. The planner tests finite hold durations and continuously re-plans while a dash is active, releasing when that is the safer path or when the dash ends.
 - **Separate diagnostics** — debug logging now reports Dash Orb contact, activation and active-dash state separately from ordinary orb contacts.
 - **Version metadata** — uses the valid Geode prerelease form `v0.7.0-beta.1`; the old `v0.7.0-D` suffix was not a valid prerelease label.
+
 
 ## v0.6.0 highlights
 
@@ -26,7 +36,7 @@ That distinction is intentional. Orb activation, pads, moving objects, triggers,
 ## Existing gameplay systems
 
 - **Auto Play** — hidden-player prediction for cube, robot, ball, ship, UFO, swing, wave and dual mode. Platformer levels are not supported.
-- **Orbs and pads** — ordinary jump orbs use frame-aligned tap planning; Dash Orbs use a sustained, timed hold planner and are confirmed through the actual simulated dash-state transition. Common pads are included in the predictive collision pass. Custom/event-linked behavior is not fully emulated.
+- **Orbs and pads** — ordinary jump orbs use frame-aligned tap planning; Dash Orbs use a sustained hold whose timer starts after confirmed dash activation; Spider Orbs are detected by runtime type or object ID `3004` and tracked through their teleport effect. Common pads are included in the predictive collision pass. Exact nearest-surface Spider collision still needs live in-game verification.
 - **Portals** — gravity, speed and size portals are passed through the game's collision path for the hidden player. Mode, dual and teleport portals remain prediction boundaries.
 - **Trajectory overlay** — green = press & hold; red = release. The overlay uses the same simulation engine as the bot.
 - **Debug Log** — logs bot decisions and zone transitions when enabled.
@@ -87,15 +97,14 @@ geode build
 - Ball selects a single gravity-flip pulse per re-plan; it is not a long-sequence optimizer.
 - Wave Experimental can still make poor decisions in some corridors; the four-candidate reduction lowers work but also reduces search breadth.
 - The 25% scanner classifies loaded objects and reports zone composition. It does not simulate all future checkpoint zones simultaneously, change planner scoring based on zone counts, or recreate independent trigger/object-state graphs.
-- Dash Orb planning relies on the clone reaching the game's real dash state. Unusual custom/event-linked ring behavior, arbitrary group triggers and teleport-orb destination state may still be missed. The included offline test harness verifies Dash Orb identification and tracking, not the game's full dash physics.
+- Dash Orb planning relies on the clone reaching the game's real dash state. S-block timing, custom/event-linked behavior and unusual trigger chains may still differ from live gameplay.
+- Spider Orb planning recognizes the interaction and listens for the Spider-specific teleport effect, but predicting the exact nearest valid surface requires the game's full live collision environment. Runtime verification is still required.
+- Per-level death learning uses progress and recent event telemetry. It cannot yet infer every collision/trigger cause, and a higher progress score on one attempt does not prove the selected preset alone caused the improvement.
 - The floating panel is a lightweight touch-drag panel, not a full QOLMod/Eclipse-style tabbed settings framework. Detailed numeric tuning remains in Geode settings.
 - The included offline physics is a toy harness. In-game behavior must still be tested on actual Geometry Dash 2.2081.
 
 
 ## v0.7.0 performance update
 
-The floating panel now includes performance preset and adaptive-budget controls.
-Ultra Low/Low presets reduce predictive lookahead, visual trajectory refresh is throttled,
-and jump/frame-hitch grace defers non-critical preview work. Auto Play's live decision
-path remains active. The current full-level object scan is still synchronous, so this is
-not yet a complete incremental scanner/global planner release.
+The floating panel now includes a device frame-budget preset and adaptive-budget controls. Per-level planning depth is learned separately.
+Device Budget and Adaptive Budget tune bounded background work, UI refresh and jump/frame-hitch deferral. The level-specific strategy profile selects the planning horizon independently. Auto Play's live decision path remains active. The current full-level object scan is still synchronous, so this is not yet a complete incremental scanner/global planner release.

@@ -1,3 +1,13 @@
+# v0.8.0-beta.1 — per-level strategy learning
+
+- Correct Dash Orb hold timing so duration starts after confirmed `m_isDashing`, not at initial button-down. Added a bounded activation watchdog.
+- Track Spider Orb contact and activation separately, using the Spider teleport-effect hook as an activation signal.
+- Add persistent per-level strategy trials across Ultra Low, Low, Balanced and High; score observed progress and prediction misses.
+- Separate planning profile from Device Budget. Device Budget remains a workload control; per-level profile determines planning horizon.
+- Record progress, strategy, recent orb evidence and collision object ID/type/position on Auto Play death; emit likely diagnosis and next-step advice. Persist per-level counters for repeated death-cause categories.
+- Add offline interaction and level-strategy persistence tests. These are portable unit tests, not live Geometry Dash physics validation.
+- Android64 Geode build and in-game verification have not been run in this environment.
+
 # v0.7.0-beta.1 (Dash Orb support)
 
 - Recognize green Dash Orb object ID `1704` and pink Gravity Dash Orb ID `1751`, also using the `DashRing` / `GravityDashRing` runtime types.
