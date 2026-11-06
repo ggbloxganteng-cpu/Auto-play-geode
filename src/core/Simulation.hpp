@@ -267,6 +267,8 @@ struct SimResult {
     int orbActivations = 0;
     int firstOrbContactStep = -1;
     int firstOrbActivationStep = -1;
+    // Sum of |y - hoverTargetY| over the first hoverSteps substeps (straight-fly metric).
+    float hoverError = 0.f;
 };
 
 enum class SimPlan {
@@ -326,6 +328,8 @@ struct SimRig {
     float yOffset = 0.f; // shift the clones vertically to test how much room a path has
     bool roomAwareWave = false; // experimental wave controller (setting)
     bool deepWaveSearch = false; // optional wider search budget
+    int hoverSteps = 0;          // >0: accumulate SimResult::hoverError over this many substeps
+    float hoverTargetY = 0.f;
 };
 
 SimResult runSimulation(
@@ -467,6 +471,8 @@ SimResult runSimulation(
             draw->drawSegment(previous, current, 0.8f, color);
         }
         previous = current;
+
+        if (i < rig.hoverSteps) result.hoverError += std::fabs(current.y - rig.hoverTargetY);
 
         ++result.survived;
 
@@ -894,12 +900,92 @@ static OrbTapPlan findOrbTapPlan(SimRig const& rig, SimResult const& idle, int b
     return chooseOrbTapCandidate(idle, candidates, count);
 }
 
+// ---- Straight fly (ship / wave / UFO / swing) ----
+// When neither input leads to a hazard inside the lookahead, the bot used to
+// just release, so a ship sank to the floor and a wave drifted diagonally.
+// Instead it now holds the altitude it had when the free stretch began. The
+// physics is never modelled by hand: a few short candidate input plans are
+// simulated and the one that keeps the player closest to the target wins.
+struct HoverState {
+    bool active = false;
+    float targetY = 0.f;
+};
+
+constexpr int kHoverFrames = 6;        // look-ahead of the altitude comparison
+constexpr float kHoverSwitchEps = 0.5f; // anti-flap: summed |dy| advantage needed to change input
+
+static bool tryHoverFlight(
+    SimRig const& rig, SimResult const& idle, int botSteps, bool currentlyHolding,
+    HoverState& hover, BotAction& outAction
+) {
+    PlayerObject* p = rig.source;
+    const bool tapFamily = p->m_isBird || p->m_isSwing; // flap / gravity flip per press edge
+
+    auto leave = [&]() { hover.active = false; return false; };
+    if (idle.died && idle.survived < botSteps) return leave();
+    SimResult other = tapFamily ? probe(rig, SimPlan::Tap, 0, -1, botSteps)
+                                : probe(rig, SimPlan::Hold, 0, -1, botSteps);
+    if (other.died && other.survived < botSteps) return leave();
+
+    // Free flight: both choices are safe. Remember the altitude once.
+    if (!hover.active) {
+        hover.active = true;
+        hover.targetY = p->getPositionY();
+    }
+
+    const int frameSteps = std::clamp(g_frameSubsteps, 1, 16);
+    SimRig hr = rig;
+    hr.hoverSteps = std::clamp(kHoverFrames * frameSteps, 12, 64);
+    hr.hoverTargetY = hover.targetY;
+
+    struct Candidate { SimPlan plan; int delay; int holdSteps; BotAction first; };
+    const Candidate holdFamily[] = {
+        {SimPlan::Release, 0, -1, BotAction::Release},
+        {SimPlan::Hold, 0, -1, BotAction::Hold},
+        {SimPlan::Hold, 0, frameSteps, BotAction::Hold},
+        {SimPlan::Hold, 0, 3 * frameSteps, BotAction::Hold},
+        {SimPlan::Hold, frameSteps, -1, BotAction::Release},
+        {SimPlan::Hold, 3 * frameSteps, -1, BotAction::Release},
+    };
+    const Candidate tapFamilyList[] = {
+        {SimPlan::Release, 0, -1, BotAction::Release},
+        {SimPlan::Tap, 0, -1, BotAction::Tap},
+        {SimPlan::Tap, frameSteps, -1, BotAction::Release},
+        {SimPlan::Tap, 2 * frameSteps, -1, BotAction::Release},
+        {SimPlan::Tap, 4 * frameSteps, -1, BotAction::Release},
+    };
+    const Candidate* list = tapFamily ? tapFamilyList : holdFamily;
+    const int count = tapFamily ? 5 : 6;
+
+    const BotAction current = tapFamily ? BotAction::Release
+        : (currentlyHolding ? BotAction::Hold : BotAction::Release);
+    float bestErr = 1e30f;
+    float bestSameErr = 1e30f;
+    BotAction bestAction = current;
+    for (int i = 0; i < count; ++i) {
+        SimResult r = probe(hr, list[i].plan, list[i].delay, list[i].holdSteps, hr.hoverSteps);
+        if (r.died) continue;
+        if (r.hoverError < bestErr) {
+            bestErr = r.hoverError;
+            bestAction = list[i].first;
+        }
+        if (list[i].first == current && r.hoverError < bestSameErr) bestSameErr = r.hoverError;
+    }
+    if (bestErr > 1e29f) return leave(); // every short candidate died: let the normal planner decide
+
+    // Keep the current input unless the alternative is clearly closer to the target.
+    if (bestAction != current && bestSameErr - bestErr < kHoverSwitchEps) bestAction = current;
+    outAction = bestAction;
+    return true;
+}
+// ---- end straight fly ----
+
 // Decides what the bot should do this frame.
 // `idle` is the "release now" simulation (it may be longer than botSteps).
 BotAction decideAutoPress(
     SimRig const& rig, SimResult const& idle, int botSteps, bool currentlyHolding,
     WavePlan* selectedWavePlan = nullptr, int* selectedTimedHoldSteps = nullptr,
-    int* selectedOrbTapDelaySteps = nullptr
+    int* selectedOrbTapDelaySteps = nullptr, HoverState* hover = nullptr
 ) {
     PlayerObject* p = rig.source;
     if (selectedOrbTapDelaySteps) *selectedOrbTapDelaySteps = 0;
@@ -911,6 +997,15 @@ BotAction decideAutoPress(
     if (orbPlan.found) {
         if (selectedOrbTapDelaySteps) *selectedOrbTapDelaySteps = orbPlan.delaySteps;
         return orbPlan.delaySteps <= 0 ? BotAction::Tap : BotAction::DelayedTap;
+    }
+
+    if (hover) {
+        BotAction hoverAction = BotAction::Release;
+        if (isFlyingMode(p) && tryHoverFlight(rig, idle, botSteps, currentlyHolding, *hover, hoverAction)) {
+            if (selectedWavePlan) *selectedWavePlan = WavePlan{};
+            return hoverAction;
+        }
+        hover->active = false;
     }
 
     if (p->m_isDart) {
