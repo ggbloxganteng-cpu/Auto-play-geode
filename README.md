@@ -1,6 +1,13 @@
 # Auto Trajectory
 
-Geode mod for Geometry Dash **2.2081** (Geode **v5.11.2**) — **v0.6.0**.
+Geode mod for Geometry Dash **2.2081** (Geode **v5.11.2**) — **v0.7.0-beta.1**.
+
+## v0.7.0-beta.1 — Dash Orb support
+
+- **Dash Orb planning** — recognizes the green Dash Orb (1704) and pink Gravity Dash Orb (1751), distinguishes them from ordinary jump orbs, and schedules a frame-aligned hold at the predicted contact window.
+- **Real activation confirmation** — a Dash Orb candidate is accepted only when the simulated player enters the game's `m_isDashing` state. The planner tests finite hold durations and continuously re-plans while a dash is active, releasing when that is the safer path or when the dash ends.
+- **Separate diagnostics** — debug logging now reports Dash Orb contact, activation and active-dash state separately from ordinary orb contacts.
+- **Version metadata** — uses the valid Geode prerelease form `v0.7.0-beta.1`; the old `v0.7.0-D` suffix was not a valid prerelease label.
 
 ## v0.6.0 highlights
 
@@ -19,7 +26,7 @@ That distinction is intentional. Orb activation, pads, moving objects, triggers,
 ## Existing gameplay systems
 
 - **Auto Play** — hidden-player prediction for cube, robot, ball, ship, UFO, swing, wave and dual mode. Platformer levels are not supported.
-- **Orbs and pads** — common ring/orb instances and pads are included in the predictive collision pass. Orb contact and real `ringJump()` activation are tracked separately. Immediate and short delayed click candidates are supported; custom/event-linked behavior is not fully emulated.
+- **Orbs and pads** — ordinary jump orbs use frame-aligned tap planning; Dash Orbs use a sustained, timed hold planner and are confirmed through the actual simulated dash-state transition. Common pads are included in the predictive collision pass. Custom/event-linked behavior is not fully emulated.
 - **Portals** — gravity, speed and size portals are passed through the game's collision path for the hidden player. Mode, dual and teleport portals remain prediction boundaries.
 - **Trajectory overlay** — green = press & hold; red = release. The overlay uses the same simulation engine as the bot.
 - **Debug Log** — logs bot decisions and zone transitions when enabled.
@@ -80,7 +87,7 @@ geode build
 - Ball selects a single gravity-flip pulse per re-plan; it is not a long-sequence optimizer.
 - Wave Experimental can still make poor decisions in some corridors; the four-candidate reduction lowers work but also reduces search breadth.
 - The 25% scanner classifies loaded objects and reports zone composition. It does not simulate all future checkpoint zones simultaneously, change planner scoring based on zone counts, or recreate independent trigger/object-state graphs.
-- Orb support focuses on standard ring instances. Custom/event-linked ring behavior, arbitrary group triggers and teleport-orb destination state may still be missed.
+- Dash Orb planning relies on the clone reaching the game's real dash state. Unusual custom/event-linked ring behavior, arbitrary group triggers and teleport-orb destination state may still be missed. The included offline test harness verifies Dash Orb identification and tracking, not the game's full dash physics.
 - The floating panel is a lightweight touch-drag panel, not a full QOLMod/Eclipse-style tabbed settings framework. Detailed numeric tuning remains in Geode settings.
 - The included offline physics is a toy harness. In-game behavior must still be tested on actual Geometry Dash 2.2081.
 

@@ -1,3 +1,19 @@
+# v0.7.0-beta.1 (Dash Orb support)
+
+- Recognize green Dash Orb object ID `1704` and pink Gravity Dash Orb ID `1751`, also using the `DashRing` / `GravityDashRing` runtime types.
+- Separate Dash Orb contact tracking from ordinary jump-orb contacts so the tap planner cannot mistake a Dash Orb overlap for a normal jump-orb activation.
+- Add frame-aligned sustained-hold probes. A candidate is only accepted after the hidden clone transitions into the game's `m_isDashing` state; the live controller schedules the hold, checks the dash state and re-plans the release timing.
+- Preserve delayed Dash Orb schedules while the live bot waits with Jump released. Add regression checks for Dash Orb classification, deduplicated contact telemetry and fresh input edges.
+- Correct Geode metadata from the invalid `v0.7.0-D` prerelease suffix to `v0.7.0-beta.1`.
+- Offline interaction/planning/hover checks pass. A Geode Android64 build and in-game Dash Orb tests have not yet been run.
+
+# v0.7.0-E (straight fly)
+
+- New setting "Straight Fly" (default ON): in Ship, Wave, UFO and Swing, when neither Hold nor Release leads to a hazard inside the lookahead, the bot holds the altitude it had when the free stretch began instead of sinking/drifting.
+- Implemented by simulating a few short candidate input plans and picking the one closest to the target altitude (no hand-written physics, so it follows the game's real physics through the existing simulator). Falls back to the normal planner the moment a hazard shows up.
+- Offline test `tests/hover.cpp` (toy ship/wave physics only): ship stays within ~3 units and wave within ~5 units of the target; with dense hazards it dies no more often than the old behaviour. UFO and Swing are NOT covered by the offline stubs.
+- Cost: one extra lookahead probe plus up to 6 short probes per frame while in free flight (turn the setting off if frame time suffers).
+
 # v0.7.0-D (panel update)
 
 - Floating panel widened to 210 px; geometry now lives in shared constants (`at::ui::kPanel*`) so layout and touch hit-area can't drift apart.
