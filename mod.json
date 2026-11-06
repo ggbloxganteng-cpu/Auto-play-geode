@@ -67,6 +67,12 @@
 			"description": "Wave Planner 2.0: frame-aligned one/two-switch candidate search. Straight paths are tested first; deeper candidates are bounded and opt-in.",
 			"default": false
 		},
+		"straight-fly": {
+			"type": "bool",
+			"name": "Straight Fly (Ship / Wave / UFO / Swing)",
+			"description": "When nothing threatens above or below, hold the current altitude instead of drifting. Costs a few extra short simulations per frame while flying.",
+			"default": true
+		},
 		"ui-title": {
 			"type": "title",
 			"name": "Interface"
