@@ -301,6 +301,11 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         bool timedHoldActive = false;
         int timedHoldStepsRemaining = 0;
         bool timedHoldRobotMode = false;
+        bool timedHoldDashMode = false;
+        bool timedHoldDashStarted = false;
+        bool dashHoldScheduled = false;
+        int dashHoldStepsRemaining = 0;
+        int dashHoldDurationSteps = 0;
         bool loggedSetup = false;
         int logFrame = 0;
         int performanceLogFrame = 0;
@@ -627,6 +632,10 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
     void cancelOrbTapSchedule() {
         m_fields->orbTapScheduled = false;
         m_fields->orbTapStepsRemaining = 0;
+        // All pending orb interactions are mutually exclusive.
+        m_fields->dashHoldScheduled = false;
+        m_fields->dashHoldStepsRemaining = 0;
+        m_fields->dashHoldDurationSteps = 0;
     }
 
     void cancelWaveTransition() {
@@ -639,6 +648,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         m_fields->timedHoldActive = false;
         m_fields->timedHoldStepsRemaining = 0;
         m_fields->timedHoldRobotMode = false;
+        m_fields->timedHoldDashMode = false;
+        m_fields->timedHoldDashStarted = false;
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) override {
@@ -836,9 +847,13 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
         bool timedHoldForced = false;
         bool timedHoldJustReleased = false;
         if (m_fields->timedHoldActive) {
-            const bool modeChanged = !m_player1->m_isRobot ||
-                m_player1->m_isRobot != m_fields->timedHoldRobotMode;
-            if (modeChanged) {
+            const bool modeChanged = m_fields->timedHoldRobotMode && !m_player1->m_isRobot;
+            if (m_fields->timedHoldDashMode && m_player1->m_isDashing) {
+                m_fields->timedHoldDashStarted = true;
+            }
+            const bool dashEnded = m_fields->timedHoldDashMode &&
+                m_fields->timedHoldDashStarted && !m_player1->m_isDashing;
+            if (modeChanged || dashEnded) {
                 this->cancelTimedHold();
                 this->releaseBot();
                 timedHoldJustReleased = true;
@@ -847,8 +862,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                 if (m_fields->timedHoldStepsRemaining <= 0) {
                     this->releaseBot();
                     this->cancelTimedHold();
-                    // Re-plan in this same postUpdate. Skipping one extra frame
-                    // here can miss a chained Robot jump or a landing window.
+                    // Re-plan in this same postUpdate. For Dash Orbs this release
+                    // ends the dash; Robot keeps its finite jump pulse behavior.
                 } else {
                     timedHoldForced = true;
                 }
@@ -912,6 +927,31 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             }
         }
 
+        bool dashHoldForced = false;
+        bool dashHoldDue = false;
+        int dashHoldForcedSteps = 0;
+        if (m_fields->dashHoldScheduled) {
+            const bool due = advanceOrbTapSchedule(
+                m_fields->dashHoldStepsRemaining, g_frameSubsteps
+            );
+            if (due) {
+                dashHoldForced = true;
+                dashHoldDue = true;
+                dashHoldForcedSteps = m_fields->dashHoldDurationSteps;
+                m_fields->dashHoldScheduled = false;
+                m_fields->dashHoldStepsRemaining = 0;
+                m_fields->dashHoldDurationSteps = 0;
+            } else if (!orbTapScheduleStillReachable(
+                idleResult, m_fields->dashHoldStepsRemaining
+            )) {
+                this->cancelOrbTapSchedule();
+            } else {
+                // Keep Jump released until the chosen frame; pressing early can
+                // jump before a Dash Orb and invalidate the predicted approach.
+                dashHoldForced = true;
+            }
+        }
+
         if (autoOn) {
             BotAction action = BotAction::Release;
             const bool scheduledWave = m_player1->m_isDart && rig.roomAwareWave;
@@ -921,9 +961,20 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
             }
             int selectedTimedHoldSteps = 0;
             int selectedOrbTapDelaySteps = 0;
-            if (orbTapForced || timedHoldForced) m_fields->hover.active = false;
+            int selectedDashHoldSteps = 0;
+            int selectedDashHoldDelaySteps = 0;
+            if (orbTapForced || dashHoldForced || timedHoldForced) m_fields->hover.active = false;
             if (orbTapForced) {
                 action = orbTapForcedAction;
+            } else if (dashHoldForced) {
+                if (!dashHoldDue) {
+                    action = BotAction::Release;
+                } else if (dashHoldForcedSteps < 0) {
+                    action = BotAction::Hold;
+                } else {
+                    action = BotAction::DashTimedHold;
+                    selectedDashHoldSteps = dashHoldForcedSteps;
+                }
             } else if (timedHoldForced) {
                 action = BotAction::Hold;
             } else if (timedHoldJustReleased) {
@@ -951,7 +1002,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                 }
             }
 
-            if (!orbTapForced && !timedHoldForced && !timedHoldJustReleased &&
+            if (!orbTapForced && !dashHoldForced && !timedHoldForced && !timedHoldJustReleased &&
                 !waveDidSwitch && (!scheduledWave || !m_fields->waveTransitionActive)) {
                 WavePlan selectedWavePlan;
                 action = decideAutoPress(
@@ -959,7 +1010,9 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                     scheduledWave ? &selectedWavePlan : nullptr,
                     &selectedTimedHoldSteps,
                     &selectedOrbTapDelaySteps,
-                    straightFlyEnabled() ? &m_fields->hover : nullptr
+                    straightFlyEnabled() ? &m_fields->hover : nullptr,
+                    &selectedDashHoldSteps,
+                    &selectedDashHoldDelaySteps
                 );
                 if (scheduledWave && selectedWavePlan.switchCount > 0) {
                     m_fields->waveTransitionActive = true;
@@ -976,8 +1029,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                     m_fields->lastLoggedAction = static_cast<int>(action);
                     log::info(
                         "[AT] f={} x={:.0f} y={:.0f} gnd={} up={} mode={} dual={} "
-                        "idle(died={} surv={} orbContact={} orbFirst={} orbActivated={}) "
-                        "tapPulse={} tapLeft={} orbPlanDelay={} orbDelayLeft={} robotHold={} action={}",
+                        "idle(died={} surv={} orbContact={} orbFirst={} orbActivated={} dashContact={} dashFirst={} dashActive={} dashActivated={}) "
+                        "tapPulse={} tapLeft={} orbPlanDelay={} orbDelayLeft={} holdLeft={} action={}",
                         m_fields->logFrame, m_player1->getPositionX(), m_player1->getPositionY(),
                         m_player1->m_isOnGround, m_player1->m_isUpsideDown,
                         m_player1->m_isBall ? "ball" : (m_player1->m_isRobot ? "robot" :
@@ -986,7 +1039,9 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                             (m_player1->m_isSpider ? "spider" : "cube")))))),
                         rig.dummy2 != nullptr, idleResult.died, idleResult.survived,
                         idleResult.orbContacts, idleResult.firstOrbContactStep,
-                        idleResult.orbActivations, m_fields->botTapActive,
+                        idleResult.orbActivations, idleResult.dashContacts,
+                        idleResult.firstDashContactStep, idleResult.dashActiveAtEnd,
+                        idleResult.dashActivations, m_fields->botTapActive,
                         m_fields->botTapStepsRemaining, selectedOrbTapDelaySteps,
                         m_fields->orbTapStepsRemaining,
                         m_fields->timedHoldStepsRemaining, static_cast<int>(action)
@@ -1004,10 +1059,8 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                 case BotAction::TimedHold:
                     this->cancelTap();
                     this->cancelOrbTapSchedule();
+                    this->cancelTimedHold();
                     this->cancelWaveTransition();
-                    // A planned finite pulse also starts from released input
-                    // in the clone. Force a fresh live edge if a previous
-                    // Hold left Jump down.
                     if (requiresFreshPressEdge(action, m_fields->botHolding)) this->releaseBot();
                     this->pressBot();
                     m_fields->timedHoldActive = true;
@@ -1015,6 +1068,33 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                         std::max(1, g_frameSubsteps), selectedTimedHoldSteps
                     );
                     m_fields->timedHoldRobotMode = m_player1->m_isRobot;
+                    break;
+                case BotAction::DashTimedHold:
+                    this->cancelTap();
+                    this->cancelOrbTapSchedule();
+                    this->cancelTimedHold();
+                    this->cancelWaveTransition();
+                    if (requiresFreshPressEdge(action, m_fields->botHolding)) this->releaseBot();
+                    this->pressBot();
+                    m_fields->timedHoldActive = true;
+                    m_fields->timedHoldStepsRemaining = std::max(
+                        std::max(1, g_frameSubsteps), selectedDashHoldSteps
+                    );
+                    m_fields->timedHoldRobotMode = false;
+                    m_fields->timedHoldDashMode = true;
+                    m_fields->timedHoldDashStarted = m_player1->m_isDashing;
+                    break;
+                case BotAction::DelayedDashHold:
+                    this->cancelTap();
+                    this->cancelOrbTapSchedule();
+                    this->cancelTimedHold();
+                    this->cancelWaveTransition();
+                    this->releaseBot();
+                    m_fields->dashHoldScheduled = true;
+                    m_fields->dashHoldStepsRemaining = std::max(
+                        std::max(1, g_frameSubsteps), selectedDashHoldDelaySteps
+                    );
+                    m_fields->dashHoldDurationSteps = selectedDashHoldSteps;
                     break;
                 case BotAction::DelayedTap:
                     this->cancelTap();
@@ -1040,7 +1120,7 @@ class $modify(AutoTrajPlayLayer, PlayLayer) {
                 case BotAction::Release:
                 default:
                     this->cancelTap();
-                    if (!orbTapForced) this->cancelOrbTapSchedule();
+                    if (!orbTapForced && !dashHoldForced) this->cancelOrbTapSchedule();
                     this->cancelTimedHold();
                     this->releaseBot();
                     break;
