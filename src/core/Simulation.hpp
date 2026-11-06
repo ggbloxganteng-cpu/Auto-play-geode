@@ -44,8 +44,15 @@ namespace {
     int g_simOrbActivationCount = 0;
     int g_simFirstOrbContactStep = -1;
     int g_simFirstOrbActivationStep = -1;
+    int g_simRegularOrbContactCount = 0;
+    int g_simFirstRegularOrbContactStep = -1;
+    int g_simDashContactCount = 0;
+    int g_simFirstDashContactStep = -1;
+    int g_simDashActivationCount = 0;
+    int g_simFirstDashActivationStep = -1;
     std::unordered_set<RingObject*> g_simRecordedOrbContacts;
     std::unordered_set<RingObject*> g_simRecordedOrbActivations;
+    std::unordered_set<RingObject*> g_simRecordedDashContacts;
 
     // Simulation tuning, all in physics substeps (240 per second).
     constexpr int kWaitMarginSteps = 2;    // safety margin when deciding to wait for a later jump
@@ -84,6 +91,16 @@ namespace {
     // collision path can update mini/normal size on the hidden clone directly.
     bool isTeleportOrb(GameObject* object) {
         return object && object->m_objectType == GameObjectType::TeleportOrb;
+    }
+
+    // Geometry Dash 2.2081: green Dash Orb = 1704, pink Gravity Dash Orb = 1751.
+    // Runtime types are preferred; IDs also cover levels where object type is
+    // rewritten by compatibility mods such as No-Touch.
+    bool isDashOrb(GameObject* object) {
+        if (!object) return false;
+        return object->m_objectType == GameObjectType::DashRing ||
+               object->m_objectType == GameObjectType::GravityDashRing ||
+               object->m_objectID == 1704 || object->m_objectID == 1751;
     }
 
     bool requiresPortalResync(int id) {
@@ -197,17 +214,46 @@ namespace {
         g_simOrbActivationCount = 0;
         g_simFirstOrbContactStep = -1;
         g_simFirstOrbActivationStep = -1;
+        g_simRegularOrbContactCount = 0;
+        g_simFirstRegularOrbContactStep = -1;
+        g_simDashContactCount = 0;
+        g_simFirstDashContactStep = -1;
+        g_simDashActivationCount = 0;
+        g_simFirstDashActivationStep = -1;
         g_simRecordedOrbContacts.clear();
         g_simRecordedOrbActivations.clear();
+        g_simRecordedDashContacts.clear();
+    }
+
+    void recordSimDashContact(RingObject* ring, int step) {
+        if (!ring) return;
+        if (g_simRecordedDashContacts.insert(ring).second) ++g_simDashContactCount;
+        if (g_simFirstDashContactStep < 0 || step < g_simFirstDashContactStep) {
+            g_simFirstDashContactStep = step;
+        }
     }
 
     void recordSimOrbContact(RingObject* ring, int step) {
         if (!ring) return;
-        if (g_simRecordedOrbContacts.insert(ring).second) {
-            ++g_simOrbContactCount;
-        }
+        const bool firstContact = g_simRecordedOrbContacts.insert(ring).second;
+        if (firstContact) ++g_simOrbContactCount;
         if (g_simFirstOrbContactStep < 0 || step < g_simFirstOrbContactStep) {
             g_simFirstOrbContactStep = step;
+        }
+        if (isDashOrb(ring)) {
+            recordSimDashContact(ring, step);
+        } else {
+            if (firstContact) ++g_simRegularOrbContactCount;
+            if (g_simFirstRegularOrbContactStep < 0 || step < g_simFirstRegularOrbContactStep) {
+                g_simFirstRegularOrbContactStep = step;
+            }
+        }
+    }
+
+    void recordSimDashActivation(int step) {
+        ++g_simDashActivationCount;
+        if (g_simFirstDashActivationStep < 0 || step < g_simFirstDashActivationStep) {
+            g_simFirstDashActivationStep = step;
         }
     }
 
@@ -267,6 +313,13 @@ struct SimResult {
     int orbActivations = 0;
     int firstOrbContactStep = -1;
     int firstOrbActivationStep = -1;
+    int regularOrbContacts = 0;
+    int firstRegularOrbContactStep = -1;
+    int dashContacts = 0;
+    int firstDashContactStep = -1;
+    int dashActivations = 0;
+    int firstDashActivationStep = -1;
+    bool dashActiveAtEnd = false;
     // Sum of |y - hoverTargetY| over the first hoverSteps substeps (straight-fly metric).
     float hoverError = 0.f;
 };
@@ -290,12 +343,15 @@ enum class BotAction {
     Release,
     Hold,
     Tap,
-    DelayedTap, // wait for a predicted orb contact, then issue a one-frame tap
-    TimedHold // robot: hold for a validated number of physics substeps
+    DelayedTap, // wait for a predicted regular-orb contact, then issue a one-frame tap
+    TimedHold, // robot: hold for a validated number of physics substeps
+    DashTimedHold, // Dash Orb: hold through contact, then release at a validated time
+    DelayedDashHold // wait until a Dash Orb window, then begin a validated hold
 };
 
 static bool requiresFreshPressEdge(BotAction action, bool currentlyHolding) {
-    return currentlyHolding && (action == BotAction::Tap || action == BotAction::TimedHold);
+    return currentlyHolding && (action == BotAction::Tap || action == BotAction::TimedHold ||
+                                action == BotAction::DashTimedHold);
 }
 
 static bool advanceTapPulse(int& stepsRemaining, int frameSteps) {
@@ -399,6 +455,8 @@ SimResult runSimulation(
     bool pressed = false;
     bool released = false;
     bool waveInputDown = false;
+    bool dashWasActive1 = d1->m_isDashing;
+    bool dashWasActive2 = d2 ? d2->m_isDashing : false;
     int tapReleaseStep = -1;
     bool jumped = false;
     int airborneStreak = 0;
@@ -466,6 +524,15 @@ SimResult runSimulation(
             break;
         }
 
+        // Dash activation is a distinct game path from RingObject::ringJump().
+        // Observe the actual clone state after collision handling, so the planner
+        // only treats a Dash Orb as activated when the game really starts a dash.
+        if (!dashWasActive1 && d1->m_isDashing) recordSimDashActivation(i);
+        if (d2 && !dashWasActive2 && d2->m_isDashing) recordSimDashActivation(i);
+        dashWasActive1 = d1->m_isDashing;
+        if (d2) dashWasActive2 = d2->m_isDashing;
+        result.dashActiveAtEnd = d1->m_isDashing || (d2 && d2->m_isDashing);
+
         cocos2d::CCPoint current = d1->getPosition();
         if (draw && i < drawSteps) {
             draw->drawSegment(previous, current, 0.8f, color);
@@ -505,6 +572,13 @@ SimResult runSimulation(
     result.orbActivations = g_simOrbActivationCount;
     result.firstOrbContactStep = g_simFirstOrbContactStep;
     result.firstOrbActivationStep = g_simFirstOrbActivationStep;
+    result.regularOrbContacts = g_simRegularOrbContactCount;
+    result.firstRegularOrbContactStep = g_simFirstRegularOrbContactStep;
+    result.dashContacts = g_simDashContactCount;
+    result.firstDashContactStep = g_simFirstDashContactStep;
+    result.dashActivations = g_simDashActivationCount;
+    result.firstDashActivationStep = g_simFirstDashActivationStep;
+    result.dashActiveAtEnd = d1->m_isDashing || (d2 && d2->m_isDashing);
 
     releaseAll();
     restoreSimObjects();
@@ -868,13 +942,13 @@ static OrbTapPlan chooseOrbTapCandidate(
 
 static OrbTapPlan findOrbTapPlan(SimRig const& rig, SimResult const& idle, int botSteps) {
     OrbTapPlan none;
-    if (!idle.died || idle.survived >= botSteps || idle.orbContacts <= 0 ||
-        idle.firstOrbContactStep < 0 || idle.firstOrbContactStep >= botSteps) {
+    if (!idle.died || idle.survived >= botSteps || idle.regularOrbContacts <= 0 ||
+        idle.firstRegularOrbContactStep < 0 || idle.firstRegularOrbContactStep >= botSteps) {
         return none;
     }
 
     const int frameSteps = std::clamp(g_frameSubsteps, 1, 16);
-    const int contact = idle.firstOrbContactStep;
+    const int contact = idle.firstRegularOrbContactStep;
     // Do not spend extra simulations on orbs far down the level. Re-evaluate
     // as the real player approaches; this keeps scheduled clicks short-lived.
     if (contact > frameSteps * 10) return none;
@@ -898,6 +972,104 @@ static OrbTapPlan findOrbTapPlan(SimRig const& rig, SimResult const& idle, int b
         ++count;
     }
     return chooseOrbTapCandidate(idle, candidates, count);
+}
+
+struct DashHoldPlan {
+    bool found = false;
+    int delaySteps = 0;
+    int holdSteps = -1; // -1 means keep holding and re-plan from the next live frame
+    int survived = 0;
+    int activations = 0;
+};
+
+static DashHoldPlan findDashOrbHoldPlan(
+    SimRig const& rig, SimResult const& idle, int botSteps
+) {
+    DashHoldPlan best;
+    if (!idle.died || idle.survived >= botSteps || idle.dashContacts <= 0 ||
+        idle.firstDashContactStep < 0 || idle.firstDashContactStep >= botSteps ||
+        rig.source->m_isDashing) {
+        return best;
+    }
+
+    const int frameSteps = std::clamp(g_frameSubsteps, 1, 16);
+    const int contact = idle.firstDashContactStep;
+    if (contact > frameSteps * 10) return best;
+
+    // Begin near the contact rather than holding from far away (which could
+    // trigger a normal jump before the orb). The press itself is frame-aligned.
+    int firstDelay = std::max(0, contact - frameSteps);
+    firstDelay = (firstDelay / frameSteps) * frameSteps;
+    const int lastDelay = std::min(contact, firstDelay + frameSteps);
+    const int probeSteps = std::min(
+        botSteps,
+        std::max(contact + 24 * frameSteps, idle.survived + 24 * frameSteps)
+    );
+    const int afterContactFrames[] = {1, 2, 4, 8, 12, 24};
+
+    auto consider = [&](int delay, int holdSteps) {
+        SimResult result = probe(rig, SimPlan::Hold, delay, holdSteps, probeSteps);
+        if (result.dashActivations <= 0) return;
+        if (result.died && result.survived <= idle.survived + kDoomedMargin) return;
+        const int previousAfter = best.holdSteps < 0 ? 0 : best.holdSteps;
+        const int candidateAfter = holdSteps < 0 ? 0 : holdSteps;
+        const bool better = !best.found || result.survived > best.survived ||
+            (result.survived == best.survived && candidateAfter < previousAfter) ||
+            (result.survived == best.survived && candidateAfter == previousAfter && delay > best.delaySteps);
+        if (better) {
+            best.found = true;
+            best.delaySteps = delay;
+            best.holdSteps = holdSteps;
+            best.survived = result.survived;
+            best.activations = result.dashActivations;
+        }
+    };
+
+    for (int delay = firstDelay; delay <= lastDelay; delay += frameSteps) {
+        const int beforeContact = std::max(0, contact - delay);
+        for (int afterFrames : afterContactFrames) {
+            consider(delay, beforeContact + afterFrames * frameSteps);
+        }
+        // Also test a continuing hold; the live planner will re-evaluate it
+        // on subsequent frames and release when the predicted path requires it.
+        consider(delay, -1);
+    }
+    return best;
+}
+
+static BotAction decideActiveDash(
+    SimRig const& rig, SimResult const& idle, int botSteps, bool currentlyHolding,
+    int* selectedDashHoldSteps
+) {
+    if (selectedDashHoldSteps) *selectedDashHoldSteps = 0;
+    const int frameSteps = std::clamp(g_frameSubsteps, 1, 16);
+    SimResult holdForever = probe(rig, SimPlan::Hold, 0, -1, botSteps);
+
+    if (!idle.died && !holdForever.died) {
+        return currentlyHolding ? BotAction::Hold : BotAction::Release;
+    }
+    if (!holdForever.died) return BotAction::Hold;
+    if (!idle.died) return BotAction::Release;
+
+    int bestSurvived = idle.survived;
+    int bestHold = 0;
+    for (int frames : {1, 2, 3, 4, 6, 8, 12}) {
+        const int holdSteps = frames * frameSteps;
+        SimResult candidate = probe(rig, SimPlan::Hold, 0, holdSteps, botSteps);
+        if (!candidate.died) {
+            if (selectedDashHoldSteps) *selectedDashHoldSteps = holdSteps;
+            return BotAction::DashTimedHold;
+        }
+        if (candidate.survived > bestSurvived) {
+            bestSurvived = candidate.survived;
+            bestHold = holdSteps;
+        }
+    }
+    if (bestHold > 0 && bestSurvived > idle.survived + kDoomedMargin) {
+        if (selectedDashHoldSteps) *selectedDashHoldSteps = bestHold;
+        return BotAction::DashTimedHold;
+    }
+    return currentlyHolding ? BotAction::Hold : BotAction::Release;
 }
 
 // ---- Straight fly (ship / wave / UFO / swing) ----
@@ -985,10 +1157,29 @@ static bool tryHoverFlight(
 BotAction decideAutoPress(
     SimRig const& rig, SimResult const& idle, int botSteps, bool currentlyHolding,
     WavePlan* selectedWavePlan = nullptr, int* selectedTimedHoldSteps = nullptr,
-    int* selectedOrbTapDelaySteps = nullptr, HoverState* hover = nullptr
+    int* selectedOrbTapDelaySteps = nullptr, HoverState* hover = nullptr,
+    int* selectedDashHoldSteps = nullptr, int* selectedDashHoldDelaySteps = nullptr
 ) {
     PlayerObject* p = rig.source;
     if (selectedOrbTapDelaySteps) *selectedOrbTapDelaySteps = 0;
+    if (selectedDashHoldSteps) *selectedDashHoldSteps = 0;
+    if (selectedDashHoldDelaySteps) *selectedDashHoldDelaySteps = 0;
+
+    // While a dash is already active, predict when releasing or continuing to
+    // hold produces the safer route. A finite hold is scheduled separately.
+    if (p->m_isDashing) {
+        return decideActiveDash(rig, idle, botSteps, currentlyHolding, selectedDashHoldSteps);
+    }
+
+    // Dash orbs need a sustained press, not the one-frame pulse used by normal
+    // jump orbs. Confirm activation from the clone's real m_isDashing transition.
+    DashHoldPlan dashPlan = findDashOrbHoldPlan(rig, idle, botSteps);
+    if (dashPlan.found) {
+        if (selectedDashHoldSteps) *selectedDashHoldSteps = dashPlan.holdSteps;
+        if (selectedDashHoldDelaySteps) *selectedDashHoldDelaySteps = dashPlan.delaySteps;
+        if (dashPlan.delaySteps > 0) return BotAction::DelayedDashHold;
+        return dashPlan.holdSteps < 0 ? BotAction::Hold : BotAction::DashTimedHold;
+    }
 
     // Orbs need a click at the moment their hitbox is crossed. Simulate a few
     // nearby frame-aligned pulses and return a live delayed-click action when
